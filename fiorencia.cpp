@@ -870,17 +870,29 @@ static Result combat(Player &P, Enemy E, int maxRounds, bool canFlee) {
         }
 
         // Enemy turn
-        int pdef = defense(P, stance, stone, shieldUp);
-        int eroll = d(20);
-        bool ehit = eroll == 20 || (eroll != 1 && eroll + E.atk >= pdef);
-        if (ehit) {
-            int dmg = max(1, d(E.sides) + E.bonus);
-            P.hp -= dmg;
-            cl.push_back("The " + E.name + " hits (" + to_string(eroll) + "+" + to_string(E.atk) +
-                         " vs DEF " + to_string(pdef) + ") for " + to_string(dmg) + ".");
-        } else
-            cl.push_back("The " + E.name + " misses (" + to_string(eroll) + "+" + to_string(E.atk) +
-                         " vs DEF " + to_string(pdef) + ").");
+int pdef = defense(P, stance, stone, shieldUp);
+
+{
+    string note = "Your DEF this round: " + to_string(pdef) +
+                  " (base " + to_string(defense(P, 2, false, false));
+    if (stone)       note += ", +3 stoneskin";
+    if (shieldUp)    note += ", +3 ward";
+    if (stance == 1) note += ", -2 aggressive";
+    if (stance == 3) note += ", +2 defensive";
+    note += ").";
+    cl.push_back(note);
+}
+
+int enemyRoll = d(20);
+bool ehit = enemyRoll == 20 || (enemyRoll != 1 && enemyRoll + E.atk >= pdef);
+if (ehit) {
+    int dmg = max(1, d(E.sides) + E.bonus);
+    P.hp -= dmg;
+    cl.push_back("The " + E.name + " hits (" + to_string(enemyRoll) + "+" + to_string(E.atk) +
+                 " vs DEF " + to_string(pdef) + ") for " + to_string(dmg) + ".");
+} else
+    cl.push_back("The " + E.name + " misses (" + to_string(enemyRoll) + "+" + to_string(E.atk) +
+                 " vs DEF " + to_string(pdef) + ").");
 
         if (P.hp <= 0) {
             P.hp = 1;
