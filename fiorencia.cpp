@@ -1752,6 +1752,30 @@ static void settingScreen() {
     pause();
 }
 
+// Character creation: the class's primary stat gets +1, then 3 points to place freely.
+// (5 base + 1 + 3 tops out at 9, under the in-game cap of 10.)
+static void assignStats(Player &P) {
+    static const char *PRIM[3] = {"WITS", "BODY", "LORE"};
+    if (P.cls == 0) P.wits++;
+    else if (P.cls == 1) P.body++;
+    else P.lore++;
+    for (int left = 3; left > 0; left--) {
+        clearScr();
+        title("ASSIGN YOUR ATTRIBUTES");
+        rows(string("Your ") + CLS[P.cls] + " training gave +1 " + PRIM[P.cls] + ". Place " +
+             to_string(left) + " more point" + (left > 1 ? "s" : "") + " as you choose.");
+        row();
+        row("BODY " + bar(P.body, 10, 10) + " " + to_string(P.body) + "/10  HP & carry weight");
+        row("WITS " + bar(P.wits, 10, 10) + " " + to_string(P.wits) + "/10  craft / natural magic");
+        row("LORE " + bar(P.lore, 10, 10) + " " + to_string(P.lore) + "/10  ritual magic / trade");
+        bot();
+        char c = ask("ADD +1 TO [B]ODY, [W]ITS OR [L]ORE: ", "bwl");
+        if (c == 'b') P.body++;
+        else if (c == 'w') P.wits++;
+        else P.lore++;
+    }
+}
+
 static void newGame(Player &P) {
     settingScreen();
     clearScr();
@@ -1777,6 +1801,7 @@ static void newGame(Player &P) {
     bot();
     int c = ask("SELECT CLASS [1-3]: ", "123") - '1';
     startingKit(P, c);
+    assignStats(P);
     P.plot = g_forcePlot >= 0 ? g_forcePlot : d(N_PLOTS) - 1;
     P.day = g_startDay;
     outf("NAME YOUR CITIZEN: ");
