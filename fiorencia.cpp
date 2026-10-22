@@ -363,6 +363,26 @@ static bool loadGame(Player &P) {
     return true;
 }
 
+// A claimed legacy is remembered by one extra trailing line on the save file.
+// saveGame()'s own output and loadGame() are unchanged: older builds just ignore
+// the extra line, and the next saveGame() to that slot writes the file afresh.
+static const char *LEGACY_MARK = "LEGACY CLAIMED";
+static void markLegacy(const Player &P) {
+    FILE *o = fopen(savePath(P.name, P.saveSlot).c_str(), "a");
+    if (!o) return;
+    fprintf(o, "%s\n", LEGACY_MARK);
+    fclose(o);
+}
+static bool legacyClaimed(const Player &P) {
+    FILE *in = fopen(savePath(P.name, P.saveSlot).c_str(), "r");
+    if (!in) return false;
+    string s, last;
+    int n = 0;
+    while (getLine(in, s)) { last = s; n++; }
+    fclose(in);
+    return n >= 4 && last == LEGACY_MARK;
+}
+
 // ----------------------------------------------------------------------------
 //  Message log (shown on the day screen)
 // ----------------------------------------------------------------------------
@@ -651,7 +671,9 @@ static string plotEnding(const Player &P) {
     exit(0);
 }
 
-[[noreturn]] static void victory(Player &P) {
+static void newGame(Player &P);
+
+static void victory(Player &P) {
     static const char *reward[3] = {
         "You buy a GUILD HALL. Mass production: two items per hand.",
         "You buy a RURAL ESTATE. Tenants pay 50p a day, forever.",
@@ -672,8 +694,8 @@ static string plotEnding(const Player &P) {
          to_string(P.day) + " days.");
     row("IN FIORENCIA, ART IS WAR, AND YOU HAVE WON.");
     bot();
-    remove(savePath(P.name, P.saveSlot).c_str());
-    exit(0);
+    if (ask("[1] START A NEW GAME   [2] QUIT: ", "12") == '2') exit(0);
+    newGame(P);
 }
 
 // ----------------------------------------------------------------------------
@@ -743,7 +765,7 @@ static void drawCombat(const Player &P, const Enemy &E, int round, int maxRounds
     title("COMBAT  -  ROUND " + rr);
     row("YOU    HP " + bar(P.hp, P.maxhp(), 12) + " " + to_string(P.hp) + "/" +
         to_string(P.maxhp()) + "   SP " + to_string(P.sp));
-    row("       DEF " + to_string(defense(P, 2, stone, false)) + "  " + WPN[P.weapon] +
+    row("       DEF " + to_string(defense(P, 2, stone, false)) + " (no stance/ward)  " + WPN[P.weapon] +
         (P.ench ? " +" + to_string(P.ench) : string()) + (P.oil ? "  [FIRE OIL x" + to_string(P.oil) + "]" : ""));
     row();
     row(E.name);
@@ -1022,6 +1044,7 @@ static void doWork(Player &P) {
     if (!needAP(P, 1)) return;
     P.ap--;
     P.worked = 1;
+    // NOTE: all income multipliers (familiar, craft rank, class bonus, insight, climate.wage) are folded into the single reported number on purpose. Do not decompose.
     int roll = d(20);
     int earn = wage(roll * 10);
     bool bonus = roll <= P.primary();
@@ -1128,6 +1151,7 @@ static void doBuy(Player &P, string arg) {
             string k = s.key;
             k += string(max(1, 13 - (int)k.size()), ' ');
             row(l + k + cost);
+            if (s.kind == 1 && s.id == 2 && P.cls == 2) row("    [Scholars: -2 spell atk]");
         }
         row();
         row("LORE discount: " + to_string(P.loreDiscount()) + "% off all purchases.");
@@ -1153,7 +1177,8 @@ static void doBuy(Player &P, string arg) {
     if (it->flor) P.df -= cost; else P.p -= cost;
     switch (it->kind) {
         case 0: P.weapon = it->id; P.ench = 0; say(string("Bought a ") + WPN[it->id] + "."); break;
-        case 1: P.armor = it->id; say(string("Bought a ") + ARM[it->id] + "."); break;
+        case 1: P.armor = it->id; say(string("Bought a ") + ARM[it->id] + "." +
+                                      (it->id == 2 && P.cls == 2 ? string(" (Scholars in heavy armor: -2 to spell attacks.)") : string())); break;
         case 2: P.spell[it->id] = 1; say(string("Learned ") + SPL[it->id] + "."); break;
         case 3: P.rations += 5; say("Bought 5 days of rations."); break;
         case 4: P.herbs += 3; say("Bought 3 herbs."); break;
@@ -1422,6 +1447,15 @@ static void showStatus(const Player &P) {
     row("HP " + bar(P.hp, P.maxhp(), 14) + " " + to_string(P.hp) + "/" + to_string(P.maxhp()));
     row("SP " + bar(P.sp, P.maxsp(), 14) + " " + to_string(P.sp) + "/" + to_string(P.maxsp()));
     row("DEF " + to_string(defense(P, 2, false, false)));
+    row("ATK +" + to_string(P.body + P.mundMod() + P.crafted));
+    row("DMG 1d" + to_string(WPN_DIE[P.weapon]) + " + " + to_string(P.body + P.mundMod() + P.ench + P.crafted));
+    if (P.spell[0] || P.spell[1] || P.spell[2]) {
+        int satk = P.lore + P.magMod() + (P.cls == 2 && P.armor == 2 ? -2 : 0);
+        char sbuf[16];
+        snprintf(sbuf, sizeof sbuf, "%+d", satk);
+        row("SPELL ATK " + string(sbuf) + (P.cls == 2 && P.armor == 2 ? " (-2 heavy armor)" : ""));
+    }
+    if (P.spell[0]) row("FIREBOLT 2d6 + " + to_string(P.lore));
     row("Market discount: " + to_string(P.loreDiscount()) + "% (from LORE)");
     mid();
     row("Weapon: " + string(WPN[P.weapon]) + (P.ench ? " (+" + to_string(P.ench) + " enchant)" : ""));
@@ -1483,6 +1517,7 @@ static void showMagic(const Player &P) {
     line(6, "+1 WITS (max 10)", "lose 1d6 HP");
     row("  Knights: -2 to ritual rolls, double failure damage.");
     row("  Scholars: +2 to rolls, fees -25%, half failure damage.");
+    row("Note: Scholars wearing Brigandine suffer -2 to spell attacks.");
     bot();
     pause();
 }
@@ -1636,6 +1671,7 @@ static void tryLegacy(Player &P) {
         return;
     }
     P.df -= cost;
+    if (saveGame(P)) markLegacy(P);
     victory(P);
 }
 
@@ -1802,7 +1838,8 @@ int main(int argc, char **argv) {
             P.saveSlot = ask("", "123") - '0';
             if (!hasSave || !loadGame(P)) { out("!! NO VALID SAVE FOR THAT NAME/SLOT.\n"); pause(); continue; }
             g_log.clear();
-            say("Game loaded. Welcome back, " + P.name + ".");
+            if (legacyClaimed(P)) victory(P);   // won save: replay the ending, then new game / quit
+            else say("Game loaded. Welcome back, " + P.name + ".");
             playLoop(P);
         } else if (c == '3') manual();
         else return 0;
