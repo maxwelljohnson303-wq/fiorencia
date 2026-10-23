@@ -383,6 +383,20 @@ static bool legacyClaimed(const Player &P) {
     return n >= 4 && last == LEGACY_MARK;
 }
 
+// Slot picker line:  Max  1. [ ]  2. [x]  3. [ ]   ([x] = a save file exists)
+static bool slotUsed(const string &name, int slot) {
+    FILE *f = fopen(savePath(name, slot).c_str(), "r");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+static string slotLine(const string &name) {
+    string s = name;
+    for (int i = 1; i <= 3; i++)
+        s += "  " + to_string(i) + ". [" + (slotUsed(name, i) ? "x" : " ") + "]";
+    return s;
+}
+
 // ----------------------------------------------------------------------------
 //  Message log (shown on the day screen)
 // ----------------------------------------------------------------------------
@@ -1264,7 +1278,7 @@ static void doUse(Player &P, const string &arg) {
         }
         case 1: P.oil = 3; say("Fire Oil on your blade: next 3 attacks +2 fire."); break;
         case 2: P.stoneskin = 1; say("Stoneskin ready: +3 DEF in your next fight."); break;
-        case 3: P.nighteye = 1; say("Night-Eye: you see in the dark until day's end."); break;
+        case 3: P.nighteye = 1; say("Night-Eye: you may find hidden treasures until day's end."); break;
         case 4:
             if (P.poisoned) say("Antidote: the poison is purged.");
             else say("Antidote drunk. You were not poisoned.");
@@ -1421,8 +1435,15 @@ static void doQuest(Player &P) {
             break;
         }
         default:
-            if (P.nighteye) { P.herbs++; say("OMEN: with Night-Eye you spot a herb patch in the dark. +1 herb."); }
-            else {
+            if (P.nighteye && d(20) + P.wits >= 13) {   // Night-Eye: a WITS check to spot hidden treasure
+                string item;
+                int kind = d(3);
+                if (kind == 1) { int n = d(6); P.herbs += n; item = to_string(n) + (n > 1 ? " herbs" : " herb"); }
+                else if (kind == 2) { int k = d(5) - 1; P.potion[k]++; item = string(k == 4 ? "an " : "a ") + POT[k]; }
+                else if (d(2) == 1) { int w = inc(d(6) * 10); P.p += w; item = "a purse of " + to_string(w) + "p"; }
+                else { int f = d(5); P.df += f; item = "a purse of " + fmtF(f) + "f"; }
+                say("Your keen senses spot " + item + " hidden in the gloom. You discreetly add it to your wares.");
+            } else {
                 int tip = inc(d(6) * 10);
                 P.p += tip;
                 say("OMEN: " + lower(P.plot >= 0 ? string(PLOT_NAME[P.plot]) : string("the city")) +
@@ -1491,7 +1512,7 @@ static void showMagic(const Player &P) {
     row("    healing   2 herbs  1d6+2 HP, out of combat");
     row("    fireoil   1 herb   next 3 attacks +2 fire");
     row("    stoneskin 2 herbs  +3 DEF for one fight");
-    row("    nighteye  1 herb   see in the dark for the day");
+    row("    nighteye  1 herb   Find hidden treasures");
     row("    antidote  1 herb   cures poison");
     mid();
     row("RITUAL MAGIC (Pacts) - permanent, costs f + 1 HP, key LORE");
@@ -1808,8 +1829,12 @@ static void newGame(Player &P) {
     string n = trim(readLine());
     if (n.empty()) n = "Citizen";
     P.name = n.substr(0, 16);
-    outf("SAVE SLOT FOR " + P.name + " [1-3] (existing slot will be overwritten): ");
-    P.saveSlot = ask("", "123") - '0';
+    while (true) {
+        out(slotLine(P.name) + "\n");
+        P.saveSlot = ask("SAVE SLOT [1-3]: ", "123") - '0';
+        if (!slotUsed(P.name, P.saveSlot)) break;
+        if (ask("SLOT " + to_string(P.saveSlot) + " IS IN USE. OVERWRITE? [Y/N]: ", "yn") == 'y') break;
+    }
     P.hp = P.maxhp();
     P.sp = P.maxsp();
     g_log.clear();
@@ -1842,7 +1867,6 @@ int main(int argc, char **argv) {
     Player P;
     while (true) {
         clearScr();
-        bool hasSave = true;
         top();
         row();
         row("        F I O R E N C I A      A R T   I S   W A R");
@@ -1850,7 +1874,7 @@ int main(int argc, char **argv) {
         row("        DOME      TOWER     GUILD     CHAPEL");
         mid();
         row("[1]  NEW GAME");
-        row(string("[2]  CONTINUE") + (hasSave ? "" : "            (no save found)"));
+        row("[2]  CONTINUE");
         row("[3]  READ MANUAL");
         row("[4]  QUIT TO DOS");
         bot();
@@ -1858,10 +1882,16 @@ int main(int argc, char **argv) {
         if (c == '1') { newGame(P); playLoop(P); }
         else if (c == '2') {
             outf("PLAYER NAME: ");
-            P.name = trim(readLine());
-            outf("SAVE SLOT [1-3]: ");
-            P.saveSlot = ask("", "123") - '0';
-            if (!hasSave || !loadGame(P)) { out("!! NO VALID SAVE FOR THAT NAME/SLOT.\n"); pause(); continue; }
+            P.name = trim(readLine()).substr(0, 16);
+            if (P.name.empty()) P.name = "Citizen";
+            out(slotLine(P.name) + "\n");
+            string used;
+            for (int i = 1; i <= 3; i++) if (slotUsed(P.name, i)) used += (char)('0' + i);
+            if (used.empty()) { out("!! NO SAVES FOR THAT NAME.\n"); pause(); continue; }
+            char sc = ask("LOAD SLOT [" + used + "] (0 = BACK): ", used + "0");
+            if (sc == '0') continue;
+            P.saveSlot = sc - '0';
+            if (!loadGame(P)) { out("!! NO VALID SAVE FOR THAT NAME/SLOT.\n"); pause(); continue; }
             g_log.clear();
             if (legacyClaimed(P)) victory(P);   // won save: replay the ending, then new game / quit
             else say("Game loaded. Welcome back, " + P.name + ".");
