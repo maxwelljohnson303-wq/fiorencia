@@ -37,6 +37,29 @@
 //    - The ship binary is stripped (-s); keep fiorencia.debug.exe around
 //      for gdb / gprof / crash-dump symbolisation.
 // ============================================================================
+// ---------------------------------------------------------------------------
+//  Source map (read top to bottom)
+//    1. Runtime helpers, terminal UI, and command-line options
+//    2. Static catalogs: classes, equipment, spells, rituals, and economy values
+//    3. Player state and save/load compatibility
+//    4. Story data: rumors, story beats, choices, and endings
+//    5. Economy and story-state calculations
+//    6. Combat, item effects, and story hooks
+//    7. Day-to-day commands and information screens
+//    8. Daily progression, character creation, and main menu
+//
+//  Safe first edits
+//    - Add a spell: add a SpellDef row to SPELLS, using an existing effect.
+//    - Add a normal shop item: add a Shop row to SHOP, using an existing kind.
+//    - Tune progression: change the named constants in the Pacing dials block.
+//    - Change story text: edit RUMOR, BEAT, RECAP, ENDING, or ENDING_TAIL.
+//
+//  Compatibility boundary
+//    Player fields and the order written by fields() are part of the legacy save
+//    format. Avoid reordering or removing them without an explicit migration.
+//    knownSpells is written in the optional SPELLS extension after story state.
+//    Spell IDs are the row indices in SPELLS; do not reorder/reuse released IDs.
+// ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -51,8 +74,13 @@ using namespace std;
 
 // stdio output/input helpers. Deliberately no <iostream>/<fstream>/<sstream>:
 // they drag the whole locale machinery into a static build (>1 MB of exe).
-static void out(const string &s) { fwrite(s.data(), 1, s.size(), stdout); }
-static void outf(const string &s) { out(s); fflush(stdout); }
+static void out(const string &s) {
+    fwrite(s.data(), 1, s.size(), stdout);
+}
+static void outf(const string &s) {
+    out(s);
+    fflush(stdout);
+}
 // std::getline semantics: false only if EOF hit before any character was read
 static bool getLine(FILE *f, string &s) {
     s.clear();
@@ -73,7 +101,9 @@ static bool getLine(FILE *f, string &s) {
 // a throwing random_device would call terminate, and on Windows it delivers no
 // better entropy than the clock anyway. --seed N still overrides it in main().
 static mt19937 rng{(unsigned)chrono::steady_clock::now().time_since_epoch().count()};
-static int d(int n) { return uniform_int_distribution<int>(1, n)(rng); }
+static int d(int n) {
+    return uniform_int_distribution<int>(1, n)(rng);
+}
 static bool g_color = true;
 static bool g_clear = true;
 static string g_on = "\033[32m";
@@ -90,7 +120,9 @@ static string savePath(const string &name, int slot) {
 }
 
 static void resetTerm() {
-    if (g_color) outf("\033[0m");
+    if (g_color) {
+        outf("\033[0m");
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -145,9 +177,15 @@ static string bar(int cur, int mx, int len) {
     return rep("#", f) + rep(".", len - f);
 }
 
-static void top() { out("+" + rep("-", W) + "+\n"); }
-static void mid() { out("+" + rep("-", W) + "+\n"); }
-static void bot() { out("+" + rep("-", W) + "+\n"); }
+static void top() {
+    out("+" + rep("-", W) + "+\n");
+}
+static void mid() {
+    out("+" + rep("-", W) + "+\n");
+}
+static void bot() {
+    out("+" + rep("-", W) + "+\n");
+}
 static void row(const string &s = "") {
     string t = " " + s;
     int n = (int)ulen(t);
@@ -181,7 +219,9 @@ static void title(const string &t) {
     mid();
 }
 static void clearScr() {
-    if (g_clear) out("\033[2J\033[H");
+    if (g_clear) {
+        out("\033[2J\033[H");
+    }
 }
 
 static string readLine() {
@@ -215,7 +255,33 @@ static const char *CLS[3] = {"ARTISAN", "KNIGHT", "SCHOLAR"};
 static const char *WPN[4] = {"Fists", "Dagger", "Longsword", "Crossbow"};
 static const int WPN_DIE[4] = {2, 4, 8, 6};
 static const char *ARM[3] = {"None", "Leather Jerkin", "Brigandine (heavy)"};
-static const char *SPL[3] = {"Firebolt", "Heal", "Shield"};
+// SPELL CATALOG: Add a row here to create a spell using an existing effect type.
+// IDs are permanent: never reorder or reuse an ID once a released save may contain it.
+enum SpellEffect { SPELL_DAMAGE, SPELL_HEAL, SPELL_SHIELD };
+enum SpellStat { STAT_LORE, STAT_WITS, STAT_BODY, STAT_NONE };
+struct SpellDef {
+    // Catalog-only effects use the shared cast handler below. Adding a new
+    // effect enum value also requires implementing its behavior in that handler.
+    const char *key;          // shop key / unique internal key
+    const char *name;
+    const char *description;
+    char castKey;             // unique combat-menu key
+    int price;                // florins in tenths
+    SpellEffect effect;
+    SpellStat attackStat;     // used for attack rolls on damaging spells
+    int diceCount, dieSides;  // damage dice
+    SpellStat damageStat;     // extra damage added after dice
+    int flatBonus;            // extra damage/healing
+    bool slows;               // successful damage skips enemy's next turn
+};
+static const SpellDef SPELLS[] = {
+    // key,      name,      description,                  cast, price, effect,        attack stat, dice, damage stat, bonus, slows
+    {"firebolt", "Firebolt", "2d6 + LORE damage",        'f',  125, SPELL_DAMAGE, STAT_LORE, 2, 6, STAT_LORE, 0, false},
+    {"heal",     "Heal",     "Restore 1d6+2 HP",         'h',  200, SPELL_HEAL,   STAT_NONE, 1, 6, STAT_NONE, 2, false},
+    {"shield",   "Shield",   "+3 DEF for this turn",     's',  150, SPELL_SHIELD, STAT_NONE, 0, 0, STAT_NONE, 3, false},
+    {"ice ray",  "Ice Ray",  "1d3 + WITS damage; slows 1 turn", 'i', 20, SPELL_DAMAGE, STAT_WITS, 1, 3, STAT_WITS, 0, true}
+};
+static const int NSPELLS = sizeof(SPELLS) / sizeof(SPELLS[0]);
 static const char *POT[5] = {"Healing Salve", "Fire Oil", "Stoneskin Draught",
                              "Night-Eye Tincture", "Antidote"};
 static const char *POT_KEY[5] = {"healing", "fireoil", "stoneskin", "nighteye", "antidote"};
@@ -257,34 +323,54 @@ static const int CRAFT_STEP     = 15;
 static const int START_P[3]    = {550, 250, 400};  // Artisan, Knight, Scholar
 static const int START_DF[3]   = {30, 40, 40};     // tenths of a florin
 
-static int inc(int v) { return v * INCOME_PCT / 100; }
-static int wage(int v) { return v * WAGE_PCT / 100; }
-static int pct(int v, int shift) { return v * (100 + shift) / 100; }
+static int inc(int v) {
+    return v * INCOME_PCT / 100;
+}
+static int wage(int v) {
+    return v * WAGE_PCT / 100;
+}
+static int pct(int v, int shift) {
+    return v * (100 + shift) / 100;
+}
 
 // Percent shifts in the city's mood: +40 means 40% more (or better).  Set by story choices.
 struct Eco { int upkeep, wage, patron, loot, herb; };
 
 struct Shop {
-    const char *key;
-    const char *name;
+    string key;
+    string name;
     int cost;
     bool flor;
     int kind;  // 0 weapon, 1 armor, 2 spell, 3 rations, 4 herbs
     int id;
 };
+// NON-SPELL SHOP ITEMS: Add a row here to add another item using an existing item kind.
 static const Shop SHOP[] = {
     {"dagger", "Dagger  (1d4)", 12, true, 0, 1},
     {"longsword", "Longsword  (1d8)", 75, true, 0, 2},
     {"crossbow", "Crossbow  (1d6, ranged)", 50, true, 0, 3},
     {"leather", "Leather Jerkin  (+1 DEF)", 50, true, 1, 1},
     {"brigandine", "Brigandine, heavy  (+3 DEF)", 150, true, 1, 2},
-    {"firebolt", "Spell: Firebolt  (2d6+LORE)", 125, true, 2, 0},
-    {"heal", "Spell: Heal  (1d6+2 HP)", 200, true, 2, 1},
-    {"shield", "Spell: Shield  (+3 DEF, 1 turn)", 150, true, 2, 2},
-    {"rations", "Rations, 5 days of upkeep", 0, false, 3, 0},   // priced from today's upkeep, see shopPrice
-    {"herbs", "3 common herbs", 30, false, 4, 0},
+    {"rations", "Rations, 5 days of upkeep", 0, false, 3, 0},
+    {"herbs", "3 common herbs", 30, false, 4, 0}
 };
-static const int NSHOP = sizeof(SHOP) / sizeof(SHOP[0]);
+static const int NSHOP_BASE = sizeof(SHOP) / sizeof(SHOP[0]);
+static vector<Shop> shopCatalog() {
+    // Start with fixed goods, then expose every spell as a shop item.
+    vector<Shop> items(SHOP, SHOP + NSHOP_BASE);
+
+    for (int i = 0; i < NSPELLS; ++i) {
+        items.push_back({
+            SPELLS[i].key,
+            string("Spell: ") + SPELLS[i].name + "  (" + SPELLS[i].description + ")",
+            SPELLS[i].price,
+            true,  // spell prices are paid in florins
+            2,     // Shop kind 2 means spell
+            i      // index into SPELLS
+        });
+    }
+    return items;
+}
 
 // ----------------------------------------------------------------------------
 //  Player
@@ -295,7 +381,8 @@ struct Player {
     int hp = 15, sp = 15, p = 0, df = 0;
     int day = 1, ap = 3, rate = 120;
     int weapon = 0, armor = 0;
-    int spell[3] = {0, 0, 0};
+    int spell[3] = {0, 0, 0}; // legacy save fields; retained for migration compatibility
+    vector<int> knownSpells;   // extensible spell IDs, stored in an optional save extension
     int herbs = 0;
     int potion[5] = {0, 0, 0, 0, 0};
     int rations = 0, crafted = 0, ench = 0;
@@ -317,15 +404,73 @@ struct Player {
     int loreDiscount() const { return cls == 2 ? min(lore, 10) * 3 / 2 : min(lore, 10) / 2; }  // % off market
 };
 
+static bool knowsSpell(const Player &P, int id) {
+    return find(P.knownSpells.begin(), P.knownSpells.end(), id) != P.knownSpells.end();
+}
+static void learnSpell(Player &P, int id) {
+    if (id < 0 || id >= NSPELLS || knowsSpell(P, id)) return;
+    P.knownSpells.push_back(id);
+    // Mirror the original four spells into the original fields so older saves remain migratable.
+    if (id == 0) P.spell[0] = 1;
+    else if (id == 1) P.spell[1] = 1;
+    else if (id == 2) P.spell[2] |= 1;
+    else if (id == 3) P.spell[2] |= 2;
+}
+static void migrateLegacySpells(Player &P) {
+    P.knownSpells.clear();
+    if (P.spell[0]) P.knownSpells.push_back(0);
+    if (P.spell[1]) P.knownSpells.push_back(1);
+    if (P.spell[2] & 1) P.knownSpells.push_back(2);
+    if (P.spell[2] & 2) P.knownSpells.push_back(3);
+}
+static int statValue(const Player &P, SpellStat stat) {
+    switch (stat) {
+        case STAT_LORE: return P.lore;
+        case STAT_WITS: return P.wits;
+        case STAT_BODY: return P.body;
+        default: return 0;
+    }
+}
+
+// IMPORTANT: this order defines the numeric portion of every save file.
+// Keep it stable; changing the order requires a save-format migration.
 template <class F>
 static void fields(Player &P, F &&f) {
-    f(P.cls); f(P.body); f(P.wits); f(P.lore); f(P.hp); f(P.sp); f(P.p); f(P.df);
-    f(P.day); f(P.ap); f(P.rate); f(P.weapon); f(P.armor);
-    for (int &x : P.spell) f(x);
+    f(P.cls);
+    f(P.body);
+    f(P.wits);
+    f(P.lore);
+    f(P.hp);
+    f(P.sp);
+    f(P.p);
+    f(P.df);
+
+    f(P.day);
+    f(P.ap);
+    f(P.rate);
+    f(P.weapon);
+    f(P.armor);
+
+    for (int &x : P.spell) {
+        f(x);
+    }
     f(P.herbs);
-    for (int &x : P.potion) f(x);
-    f(P.rations); f(P.crafted); f(P.ench); f(P.familiar); f(P.gift); f(P.ward);
-    f(P.poisoned); f(P.prepared); f(P.oil); f(P.stoneskin); f(P.worked); f(P.nighteye);
+    for (int &x : P.potion) {
+        f(x);
+    }
+
+    f(P.rations);
+    f(P.crafted);
+    f(P.ench);
+    f(P.familiar);
+    f(P.gift);
+    f(P.ward);
+    f(P.poisoned);
+    f(P.prepared);
+    f(P.oil);
+    f(P.stoneskin);
+    f(P.worked);
+    f(P.nighteye);
     f(P.insight);
 }
 
@@ -337,6 +482,9 @@ static bool saveGame(Player &P) {
     fputs("\n", o);
     fprintf(o, "%d %d %d %d %d", P.plot, P.plotStage, P.plotWon, P.plotLost, P.plotEndTier);
     for (int x : P.plotChoice) fprintf(o, " %d", x);
+    fputs("\nSPELLS ", o);
+    fprintf(o, "%d", (int)P.knownSpells.size());
+    for (int id : P.knownSpells) fprintf(o, " %d", id);
     fputs("\n", o);
     return fclose(o) == 0;
 }
@@ -354,10 +502,27 @@ static bool loadGame(Player &P) {
         rd(P.plotStage); rd(P.plotWon); rd(P.plotLost); rd(P.plotEndTier);
         for (int &x : P.plotChoice) rd(x);
         if (!ok || P.plot < 0 || P.plot >= N_PLOTS) { fclose(in); return false; }
+        int count = -1;
+        if (fscanf(in, " SPELLS %d", &count) == 1 && count >= 0 && count <= 1000) {
+            P.knownSpells.clear();
+            for (int i = 0; i < count; ++i) {
+                int id = -1;
+                if (fscanf(in, "%d", &id) != 1 || id < 0 || id >= NSPELLS) { fclose(in); return false; }
+                if (!knowsSpell(P, id)) P.knownSpells.push_back(id);
+            }
+            // Keep legacy flags in sync for the four original spells.
+            for (int id : P.knownSpells) {
+                if (id == 0) P.spell[0] = 1;
+                else if (id == 1) P.spell[1] = 1;
+                else if (id == 2) P.spell[2] |= 1;
+                else if (id == 3) P.spell[2] |= 2;
+            }
+        } else migrateLegacySpells(P);
     } else {         // older save: roll a story now; the beats catch up night by night
         P.plot = d(N_PLOTS) - 1;
         P.plotStage = P.plotWon = P.plotLost = P.plotEndTier = 0;
         for (int &x : P.plotChoice) x = 0;
+        migrateLegacySpells(P);
     }
     fclose(in);
     return true;
@@ -647,18 +812,31 @@ static int legacyCost(const Player &P) {
     return pct(LEGACY_DF, s);
 }
 // Ritual fees: Scholars pay a quarter less.
-static int ritualCost(const Player &P, int i) { return RC[i] * (P.cls == 2 ? 75 : 100) / 100; }
-static int craftCost(const Player &P) { return CRAFT_MAT[min(max(P.crafted, 0), 3)]; }   // materials for one craft
-static int spellCost(const Player &P) { return P.cls == 2 ? 2 : 3; }   // SP per cast: Scholars cast cheaply
+static int ritualCost(const Player &P, int i) {
+    return RC[i] * (P.cls == 2 ? 75 : 100) / 100;
+}
+static int craftCost(const Player &P) {
+    return CRAFT_MAT[min(max(P.crafted, 0), 3)];  // materials for one craft
+}
+static int spellCost(const Player &P) {
+    return P.cls == 2 ? 2 : 3;  // Scholars cast spells more cheaply
+}
 static void startingKit(Player &P, int c) {
     P = Player();
-    P.cls = c; P.p = START_P[c]; P.df = START_DF[c];
-    if (c == 1) P.weapon = 2;    // Knight starts with a Longsword
-    if (c == 2) P.spell[0] = 1;  // Scholar starts with Firebolt
-    P.hp = P.maxhp(); P.sp = P.maxsp();
+    P.cls = c;
+    P.p = START_P[c];
+    P.df = START_DF[c];
+
+    if (c == 1) P.weapon = 2;   // Knight starts with a Longsword
+    if (c == 2) learnSpell(P, 0);  // Scholar starts with Firebolt
+
+    P.hp = P.maxhp();
+    P.sp = P.maxsp();
 }
 // Insight sells to patrons; the learned sell dearer.  Tenths of a florin.
-static int insightValue(const Player &P) { return inc(P.insight * (12 + 5 * P.lore) / 100); }
+static int insightValue(const Player &P) {
+    return inc(P.insight * (12 + 5 * P.lore) / 100);
+}
 
 static string plotEnding(const Player &P) {
     if (P.plot < 0 || !P.plotChoice[2]) return "";
@@ -815,6 +993,7 @@ static Result combat(Player &P, Enemy E, int maxRounds, bool canFlee) {
         int stance = ask("STANCE [1-3]: ", "123") - '0';
         int sdmg = stance == 1 ? 2 : stance == 3 ? -2 : 0;
         bool shieldUp = false;
+        bool skipEnemyTurn = false;
         bool acted = false;
         while (!acted) {
             char a = ask("ACTION [S/C/U/F]: ", "scuf");
@@ -833,34 +1012,42 @@ static Result combat(Player &P, Enemy E, int maxRounds, bool canFlee) {
                     cl.push_back("You swing and miss (" + to_string(roll) + "+" + to_string(atk) + ").");
                 acted = true;
             } else if (a == 'c') {
-                bool any = P.spell[0] || P.spell[1] || P.spell[2];
-                if (!any) { out("!! YOU KNOW NO SPELLS.\n"); continue; }
+                if (P.knownSpells.empty()) migrateLegacySpells(P); // also handles characters from older saves
+                if (P.knownSpells.empty()) { out("!! YOU KNOW NO SPELLS.\n"); continue; }
                 if (P.sp < spellCost(P)) { out("!! NOT ENOUGH SP (" + to_string(spellCost(P)) + " REQUIRED).\n"); continue; }
-                string opts;
-                string label;
-                if (P.spell[0]) { opts += "f"; label += "[F]IREBOLT "; }
-                if (P.spell[1]) { opts += "h"; label += "[H]EAL "; }
-                if (P.spell[2]) { opts += "s"; label += "[S]HIELD "; }
+                string opts, label;
+                for (int id : P.knownSpells) if (id >= 0 && id < NSPELLS) {
+                    opts += SPELLS[id].castKey;
+                    label += "[" + string(1, (char)toupper(SPELLS[id].castKey)) + "]" + string(SPELLS[id].name) + " ";
+                }
                 char sp = ask("CAST " + label + "> ", opts);
+                int spellId = -1;
+                for (int id : P.knownSpells) if (id >= 0 && id < NSPELLS && SPELLS[id].castKey == sp) { spellId = id; break; }
+                if (spellId < 0) continue;
+                const SpellDef &spell = SPELLS[spellId];
                 P.sp -= spellCost(P);
-                if (sp == 'f') {
-                    int atk = P.lore + P.magMod() + (P.cls == 2 && P.armor == 2 ? -2 : 0);
+                if (spell.effect == SPELL_SHIELD) {
+                    shieldUp = true;
+                    cl.push_back(string(spell.name) + " raises your guard (+" + to_string(spell.flatBonus) + " DEF).");
+                } else if (spell.effect == SPELL_HEAL) {
+                    int h = spell.flatBonus;
+                    for (int i = 0; i < spell.diceCount; ++i) h += d(spell.dieSides);
+                    P.hp = min(P.maxhp(), P.hp + h);
+                    cl.push_back(string(spell.name) + " restores " + to_string(h) + " HP.");
+                } else if (spell.effect == SPELL_DAMAGE) {
+                    int atk = statValue(P, spell.attackStat) + P.magMod() + (P.cls == 2 && P.armor == 2 ? -2 : 0);
                     int roll = d(20);
                     bool hit = roll == 20 || (roll != 1 && roll + atk >= E.def);
                     if (hit) {
-                        int dmg = max(1, d(6) + d(6) + P.lore + sdmg);
+                        int dmg = spell.flatBonus;
+                        for (int i = 0; i < spell.diceCount; ++i) dmg += d(spell.dieSides);
+                        dmg += statValue(P, spell.damageStat) + sdmg;
+                        dmg = max(1, dmg);
                         E.hp -= dmg;
-                        cl.push_back("Firebolt (" + to_string(roll) + "+" + to_string(atk) +
-                                     ") scorches it for " + to_string(dmg) + ".");
-                    } else
-                        cl.push_back("Your firebolt goes wide (" + to_string(roll) + "+" + to_string(atk) + ").");
-                } else if (sp == 'h') {
-                    int h = d(6) + 2;
-                    P.hp = min(P.maxhp(), P.hp + h);
-                    cl.push_back("Heal restores " + to_string(h) + " HP.");
-                } else {
-                    shieldUp = true;
-                    cl.push_back("A shimmering ward rises (+3 DEF).");
+                        if (spell.slows) skipEnemyTurn = true;
+                        cl.push_back(string(spell.name) + " (" + to_string(roll) + "+" + to_string(atk) +
+                                     ") deals " + to_string(dmg) + " damage" + (spell.slows ? " and slows the target for 1 turn." : "."));
+                    } else cl.push_back(string(spell.name) + " misses (" + to_string(roll) + "+" + to_string(atk) + ").");
                 }
                 acted = true;
             } else if (a == 'u') {
@@ -905,7 +1092,8 @@ static Result combat(Player &P, Enemy E, int maxRounds, bool canFlee) {
             return WIN;
         }
 
-        // Enemy turn
+        // Enemy turn. A successful Ice Ray skips this turn once.
+        if (!skipEnemyTurn) {
 int pdef = defense(P, stance, stone, shieldUp);
 
 {
@@ -941,13 +1129,16 @@ if (ehit) {
             pause();
             return KO;
         }
+        } // end enemy turn unless Ice Ray slowed the target
     }
 }
 
 // ----------------------------------------------------------------------------
 //  Story hooks that need combat and items
 // ----------------------------------------------------------------------------
-static bool isPlotFoe(const Player &P, const Enemy &e) { return e.plot >= 0 && e.plot == P.plot; }
+static bool isPlotFoe(const Player &P, const Enemy &e) {
+    return e.plot >= 0 && e.plot == P.plot;
+}
 
 // What a defeated foe is worth: Knights take contracts and bounties, the active plot's foes carry
 // posted bounties while the story is live, and the city's mood moves them.
@@ -1151,13 +1342,15 @@ static int shopPrice(const Player &P, const Shop &s) {
 }
 
 static void doBuy(Player &P, string arg) {
+    vector<Shop> items = shopCatalog();
+    int itemCount = (int)items.size();
     if (arg.empty()) {
         clearScr();
         title("THE MARKET  -  ARMORY / GRIMOIRE / GOODS");
         row("ITEM                                    KEY          COST");
         row(rep("-", 58));
-        for (int i = 0; i < NSHOP; i++) {
-            const Shop &s = SHOP[i];
+        for (int i = 0; i < itemCount; i++) {
+            const Shop &s = items[i];
             int c = shopPrice(P, s);
             string cost = s.flor ? fmtF(c) + "f" : to_string(c) + "p";
             string l = s.name;
@@ -1177,10 +1370,12 @@ static void doBuy(Player &P, string arg) {
         if (arg.empty()) return;
     }
     const Shop *it = nullptr;
-    for (int i = 0; i < NSHOP; i++)
-        if (string(SHOP[i].key).find(arg) == 0) { it = &SHOP[i]; break; }
+    for (int i = 0; i < itemCount; i++)
+        if (items[i].key.find(arg) == 0) { it = &items[i]; break; }
     if (!it) { say("!! NO SUCH ITEM: " + arg); return; }
-    if (it->kind == 2 && P.spell[it->id]) { say("!! YOU ALREADY KNOW THAT SPELL."); return; }
+    if (P.knownSpells.empty()) migrateLegacySpells(P);
+    bool alreadyKnowsSpell = it->kind == 2 && knowsSpell(P, it->id);
+    if (alreadyKnowsSpell) { say("!! YOU ALREADY KNOW THAT SPELL."); return; }
     int cost = shopPrice(P, *it);
     if (it->flor ? P.df < cost : P.p < cost) {
         say(it->flor ? "!! INSUFFICIENT FLORINS." : "!! INSUFFICIENT PICCIOLI.");
@@ -1193,7 +1388,10 @@ static void doBuy(Player &P, string arg) {
         case 0: P.weapon = it->id; P.ench = 0; say(string("Bought a ") + WPN[it->id] + "."); break;
         case 1: P.armor = it->id; say(string("Bought a ") + ARM[it->id] + "." +
                                       (it->id == 2 && P.cls == 2 ? string(" (Scholars in heavy armor: -2 to spell attacks.)") : string())); break;
-        case 2: P.spell[it->id] = 1; say(string("Learned ") + SPL[it->id] + "."); break;
+        case 2:
+            learnSpell(P, it->id);
+            say(string("Learned ") + SPELLS[it->id].name + ".");
+            break;
         case 3: P.rations += 5; say("Bought 5 days of rations."); break;
         case 4: P.herbs += 3; say("Bought 3 herbs."); break;
     }
@@ -1470,19 +1668,26 @@ static void showStatus(const Player &P) {
     row("DEF " + to_string(defense(P, 2, false, false)));
     row("ATK +" + to_string(P.body + P.mundMod() + P.crafted));
     row("DMG 1d" + to_string(WPN_DIE[P.weapon]) + " + " + to_string(P.body + P.mundMod() + P.ench + P.crafted));
-    if (P.spell[0] || P.spell[1] || P.spell[2]) {
+    if (!P.knownSpells.empty() || P.spell[0] || P.spell[1] || (P.spell[2] & 3)) {
         int satk = P.lore + P.magMod() + (P.cls == 2 && P.armor == 2 ? -2 : 0);
         char sbuf[16];
         snprintf(sbuf, sizeof sbuf, "%+d", satk);
         row("SPELL ATK " + string(sbuf) + (P.cls == 2 && P.armor == 2 ? " (-2 heavy armor)" : ""));
     }
-    if (P.spell[0]) row("FIREBOLT 2d6 + " + to_string(P.lore));
+    for (int id : P.knownSpells) if (id >= 0 && id < NSPELLS && SPELLS[id].effect == SPELL_DAMAGE)
+        row(string(SPELLS[id].name) + ": " + SPELLS[id].description);
     row("Market discount: " + to_string(P.loreDiscount()) + "% (from LORE)");
     mid();
     row("Weapon: " + string(WPN[P.weapon]) + (P.ench ? " (+" + to_string(P.ench) + " enchant)" : ""));
     row("Armor:  " + string(ARM[P.armor]));
     string sp;
-    for (int i = 0; i < 3; i++) if (P.spell[i]) sp += string(SPL[i]) + " ";
+    for (int id : P.knownSpells) if (id >= 0 && id < NSPELLS) sp += string(SPELLS[id].name) + " ";
+    if (sp.empty()) {
+        if (P.spell[0]) sp += "Firebolt ";
+        if (P.spell[1]) sp += "Heal ";
+        if (P.spell[2] & 1) sp += "Shield ";
+        if (P.spell[2] & 2) sp += "Ice Ray ";
+    }
     row("Spells: " + (sp.empty() ? string("none") : sp));
     row("Herbs: " + to_string(P.herbs) + "   Rations: " + to_string(P.rations) +
         (P.cls == 0 ? "   Crafted gear: +" + to_string(P.crafted) : string()));
@@ -1739,7 +1944,7 @@ static void bootScreen() {
     clearScr();
     top();
     row("F I O R E N C I A   T E R M I N A L   v1.0");
-    row("(c) 1984 CASA DELLA LIRA - ALL RIGHTS RESERVED");
+    row("(c) 2026 CASA DELLA LIRA - ALL RIGHTS RESERVED");
     mid();
     row();
     row("LOADING: DOMES.DAT  GUILDS.DAT  LEDGER.DAT  HERESY.SYS");
@@ -1851,8 +2056,8 @@ static void manual() {
 int main(int argc, char **argv) {
     // NOTE: this translation unit is compiled with -fno-exceptions -fno-rtti.
     // Do not add stoi/stol/stod, .at(), throw, dynamic_cast, or typeid below.
-    // See BUILD NOTES at the top of the file  
-	for (int i = 1; i < argc; i++) {
+    // See BUILD NOTES at the top of the file
+    for (int i = 1; i < argc; i++) {
         string a = argv[i];
         if (a == "--amber") g_on = "\033[38;5;214m";
         else if (a == "--plain") { g_color = false; g_clear = false; }
