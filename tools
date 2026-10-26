@@ -1,1 +1,2142 @@
+#!/usr/bin/env python3
+"""Fiorencia Modder (Development Workbench 2.3) — source-preserving Tkinter editor for Fiorencia: Art Is War.
+
+Python 3.8+, standard library only. This is deliberately a source editor, not a compiler.
+"""
+from __future__ import annotations
+import argparse, base64, copy, difflib, json, os, re, shlex, shutil, subprocess, sys, tempfile, threading, queue, time
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+BEGIN = "// ===== MOD ZONE BEGIN ====="
+END = "// ===== MOD ZONE END ====="
+PATCH_RE = re.compile(r"// \[MODPATCH:([A-Za-z0-9_]+)\]")
+BANNED = (r"\btry\s*\{", r"\bcatch\s*\(", r"\bthrow\b", r"\bdynamic_cast\b", r"\btypeid\b",
+          r"#\s*include\s*[<\"](?:iostream|fstream|sstream)[>\"]",
+          r"\b(?:stoi|stol|stoll|stod|stof)\s*\(", r"\.at\s*\(")
+SECTIONS = ("items", "enemies", "quests", "dialogs", "scenes", "rumors", "flavor")
+# Existing vanilla source blocks that can be inspected and edited in-place.
+# Array anchors include the declaration; function anchors expose the complete function body.
+VANILLA_BLOCKS = [
+    ("Shop inventory", "static const Shop SHOP[] = {", "initializer"),
+    ("Weapon names", "static const char *WPN[4] =", "initializer"),
+    ("Weapon damage", "static const int WPN_DIE[4] =", "initializer"),
+    ("Armor names", "static const char *ARM[3] =", "initializer"),
+    ("Spell catalog", "static const SpellDef SPELLS[] = {", "initializer"),
+    ("Potion names", "static const char *POT[5] =", "initializer"),
+    ("Potion keys", "static const char *POT_KEY[5] =", "initializer"),
+    ("Potion herb costs", "static const int POT_HERBS[5] =", "initializer"),
+    ("Player data structure", "struct Player {", "function"),
+    ("Player save-field serialization", "template <class F>\nstatic void fields(Player &P, F &&f) {", "function"),
+    ("Save game writer", "static bool saveGame(Player &P) {", "function"),
+    ("Save game loader", "static bool loadGame(Player &P) {", "function"),
+    ("Combat and spell casting", "static Result combat(Player &P, Enemy E, int maxRounds, bool canFlee) {", "function"),
+    ("Spell information screen", "static void showMagic(const Player &P) {", "function"),
+    ("Status and known-spell display", "static void showStatus(const Player &P) {", "function"),
+    ("Ritual keys", "static const char *RK[7] =", "initializer"),
+    ("Ritual names", "static const char *RN[7] =", "initializer"),
+    ("Ritual costs", "static const int RC[7] =", "initializer"),
+    ("Story beat days", "static const int BEAT_DAY[3] =", "initializer"),
+    ("Story rumors", "static const char *RUMOR[N_PLOTS][4][2] = {", "initializer"),
+    ("Story beats and choices", "static const Beat BEAT[N_PLOTS][3] = {", "initializer"),
+    ("Story recaps", "static const char *RECAP[N_PLOTS][2][2] = {", "initializer"),
+    ("Story endings", "static const char *ENDING[N_PLOTS][2] =", "initializer"),
+    ("Ending text tails", "static const char *ENDING_TAIL[3] =", "initializer"),
+    ("Ambient flavor text", "static const char *FLAVOR[] = {", "initializer"),
+    ("Legacy price", "static const int LEGACY_DF", "line"),
+    ("Legacy price spread", "static const int LEGACY_SPREAD", "line"),
+    ("Wage multiplier", "static const int WAGE_PCT", "line"),
+    ("Income multiplier", "static const int INCOME_PCT", "line"),
+    ("Base upkeep", "static const int UPKEEP_BASE", "line"),
+    ("Upkeep rise", "static const int UPKEEP_RISE", "line"),
+    ("Wealth upkeep divisor", "static const int UPKEEP_WEALTH", "line"),
+    ("Craft multiplier", "static const int CRAFT_K", "line"),
+    ("Craft rank step", "static const int CRAFT_STEP", "line"),
+    ("Craft materials", "static const int CRAFT_MAT[4]", "initializer"),
+    ("Craft tools", "static const int CRAFT_TOOLS[3]", "initializer"),
+    ("Starting money", "static const int START_P[3]", "initializer"),
+    ("Starting florins", "static const int START_DF[3]", "initializer"),
+    ("Quest/action events", "static void doQuest(Player &P) {", "function"),
+    ("Shop purchasing logic", "static void doBuy(Player &P, string arg) {", "function"),
+    ("Item use and potion effects", "static void doUse(Player &P, const string &arg) {", "function"),
+    ("Enemy generation", "static Enemy makeEnemy(bool duel = false) {", "function"),
+    ("Story beat resolution", "static void plotBeat(Player &P) {", "function"),
+]
+DEFAULT_BUNDLE = {
+ "format":"fiorencia-mod-bundle-v1",
+ "items":[
+  {"key":"sunsteel","name":"Sunsteel Falchion (1d10)","cost":90,"flor":True,"kind":0,"subtype":"weapon","arg":10,"qty":1,"reqFlag":0,"desc":"A bright-edged blade."},
+  {"key":"emberlance","name":"Spell: Ember Lance (2d6+LORE)","cost":180,"flor":True,"kind":2,"subtype":"damage","arg":2,"qty":1,"reqFlag":0,"desc":"A focused fire spell."},
+  {"key":"bittertonic","name":"Bitter Tonic","cost":20,"flor":False,"kind":5,"subtype":"heal","arg":5,"qty":1,"reqFlag":0,"desc":"Restores a little health."}],
+ "enemies":[{"name":"Gilded Blade Enforcer","hp":20,"maxhp":20,"def":13,"atk":5,"sides":8,"bonus":2,"rewardP":90,"rewardDf":12,"plot":4,"context":"guild","weight":3,"beatIdx":-1}],
+ "quests":[{"name":"A Patron's Request","archetype":"patron","weight":2,"reqClass":-1,"reqPlot":-1,"reqDayMin":1,"reqDayMax":9999,"reqFlag":0,"rewardP":20,"rewardDf":50,"grantFlag":1,"enemyIdx":-1,"dialogIdx":0,"sayIntro":"A patron requests a private audience.","sayOk":"The patron rewards your discretion.","sayFail":"The patron withdraws."}],
+ "dialogs":[
+  {"id":"patron_open","speaker":"Merchant-Prince","text":"A sealed letter lies on the table.","trigger":0,"weight":1,"reqFlag":0,"choice":["Read the letter","Refuse the commission",""],"next":[1,-1,-1],"effect":["none","none","none"],"effectArg":[0,0,0],"effectText":"","reachableFrom":"quest"},
+  {"id":"patron_read","speaker":"Merchant-Prince","text":"The letter names a corrupt guild factor.","trigger":0,"weight":1,"reqFlag":0,"choice":["Expose him","Keep the secret",""],"next":[2,-1,-1],"effect":["set flag","reward florins","none"],"effectArg":[2,30,0],"effectText":"The factor's name is recorded.","reachableFrom":"patron_open"},
+  {"id":"patron_end","speaker":"Merchant-Prince","text":"The city has one less secret—or one more.","trigger":0,"weight":1,"reqFlag":0,"choice":["Leave","Hear the terms again",""],"next":[-1,1,-1],"effect":["none","none","none"],"effectArg":[0,0,0],"effectText":"","reachableFrom":"patron_read"},
+  {"id":"ambient_talk","speaker":"Street Painter","text":"The Arno carries every rumour eventually.","trigger":1,"weight":2,"reqFlag":0,"choice":["Ask about the guild","Take your leave",""],"next":[-1,-1,-1],"effect":["none","none","none"],"effectArg":[0,0,0],"effectText":"","reachableFrom":"talk"}],
+ "scenes":[{"plot":0,"dayMin":25,"dayMax":25,"reqFlag":0,"dialogIdx":0,"title":"A Letter at Dusk","weight":1}],
+ "rumors":[{"plot":1,"stage":2,"text":"A green light burns beneath the hospice doors."}],
+ "flavor":["A FALCONER ARGUES WITH A PRIEST IN THE MARKET."]
+}
+def cpp_string(s):
+    return '"' + str(s).replace('\\','\\\\').replace('"','\\"').replace('\n','\\n').replace('\r','\\r').replace('\t','\\t') + '"'
+
+def matching_brace_end(src, opening):
+    """Return index just after matching brace, ignoring C++ strings and comments."""
+    depth=0; i=opening; state='code'
+    while i < len(src):
+        c=src[i]; n=src[i+1] if i+1<len(src) else ''
+        if state=='code':
+            if c=='"' : state='string'
+            elif c=="'" : state='char'
+            elif c=='/' and n=='/': state='line'; i+=1
+            elif c=='/' and n=='*': state='block'; i+=1
+            elif c=='{': depth+=1
+            elif c=='}':
+                depth-=1
+                if depth==0: return i+1
+        elif state=='string':
+            if c=='\\': i+=1
+            elif c=='"': state='code'
+        elif state=='char':
+            if c=='\\': i+=1
+            elif c=="'": state='code'
+        elif state=='line':
+            if c=='\n': state='code'
+        elif state=='block':
+            if c=='*' and n=='/': state='code'; i+=1
+        i+=1
+    raise ValueError("unbalanced C++ braces")
+
+def parse_initializer(src, anchor):
+    pos=src.find(anchor)
+    # The extensible source replaced the fixed SPL name array with a
+    # SpellDef catalog. Keep the legacy anchor as a fallback so older
+    # Fiorencia source versions remain editable by the same workbench.
+    if pos < 0 and anchor == "static const SpellDef SPELLS[] = {":
+        legacy_anchor = "static const char *SPL["
+        legacy_pos = src.find(legacy_anchor)
+        if legacy_pos >= 0:
+            anchor = legacy_anchor
+            pos = legacy_pos
+    if pos<0: raise ValueError("Missing anchor: "+anchor)
+    brace=src.find('{',pos)
+    if brace<0: raise ValueError("Missing initializer brace: "+anchor)
+    end=matching_brace_end(src,brace)
+    while end<len(src) and src[end].isspace(): end+=1
+    if end<len(src) and src[end]==';': end+=1
+    return pos,end,src[pos:end]
+
+def mod_zone(bundle):
+    def arr(name, typ, rows):
+        if not rows: return f"static const {typ} {name}[] = {{ {{}} }}; // empty table sentinel\n"
+        return f"static const {typ} {name}[] = {{\n" + "".join("    "+x+",\n" for x in rows) + "};\n"
+    lines=[BEGIN,
+"// Generated by Fiorencia Modder. Content data only; see README for v1 integration limits.",
+"// Runtime integration is intentionally validated separately from data serialization.",
+"struct ModItem { const char *key, *name; int cost, flor, kind; const char *subtype; int arg, qty, reqFlag; const char *desc; };",
+"struct ModEnemy { const char *name; int hp, maxhp, def, atk, sides, bonus, rewardP, rewardDf, plot; const char *context; int weight, beatIdx; };",
+"struct ModQuest { const char *name, *archetype; int weight, reqClass, reqPlot, reqDayMin, reqDayMax, reqFlag, rewardP, rewardDf, grantFlag, enemyIdx, dialogIdx; const char *sayIntro, *sayOk, *sayFail; };",
+"struct ModDialog { const char *id, *speaker, *text; int trigger, weight, reqFlag; const char *choice0, *choice1, *choice2; int next0, next1, next2; const char *effect0, *effect1, *effect2; int arg0, arg1, arg2; const char *effectText; };",
+"struct ModScene { int plot, dayMin, dayMax, reqFlag, dialogIdx, weight; const char *title; };",
+"struct ModRumor { int plot, stage; const char *text; };",
+"struct ModFlavor { int weight; const char *text; };",
+"static int g_modFlags = 0;"]
+    items=[]
+    for x in bundle.get("items",[]):
+        vals=[cpp_string(x.get("key","newitem")),cpp_string(x.get("name","New Item")),str(int(x.get("cost",0))),str(int(bool(x.get("flor",False)))),str(int(x.get("kind",5))),cpp_string(x.get("subtype","heal")),str(int(x.get("arg",0))),str(int(x.get("qty",1))),str(int(x.get("reqFlag",0))),cpp_string(x.get("desc",""))]
+        items.append("{"+", ".join(vals)+"}")
+    lines.append(arr("MOD_ITEMS","ModItem",items))
+    enemies=[]
+    for x in bundle.get("enemies",[]):
+        keys=("hp","maxhp","def","atk","sides","bonus","rewardP","rewardDf","plot","weight","beatIdx")
+        vals=[cpp_string(x.get("name","Mod Enemy"))]+[str(int(x.get(k,0))) for k in keys[:8]]+[str(int(x.get("plot",0))),cpp_string(x.get("context","generic")),str(int(x.get("weight",1))),str(int(x.get("beatIdx",-1)))]
+        enemies.append("{"+", ".join(vals)+"}")
+    lines.append(arr("MOD_ENEMIES","ModEnemy",enemies))
+    quests=[]
+    for x in bundle.get("quests",[]):
+        vals=[cpp_string(x.get("name","Mod Quest")),cpp_string(x.get("archetype","patron"))]+[str(int(x.get(k,dv))) for k,dv in [("weight",1),("reqClass",-1),("reqPlot",-1),("reqDayMin",1),("reqDayMax",9999),("reqFlag",0),("rewardP",0),("rewardDf",0),("grantFlag",0),("enemyIdx",-1),("dialogIdx",-1)]]+[cpp_string(x.get(k,"")) for k in ("sayIntro","sayOk","sayFail")]
+        quests.append("{"+", ".join(vals)+"}")
+    lines.append(arr("MOD_QUESTS","ModQuest",quests))
+    dialogs=[]
+    for x in bundle.get("dialogs",[]):
+        choices=(x.get("choice",["","",""])+["","",""])[:3]; nxt=(x.get("next",[-1,-1,-1])+[-1,-1,-1])[:3]
+        eff=(x.get("effect",["none"]*3)+["none"]*3)[:3]; args=(x.get("effectArg",[0]*3)+[0]*3)[:3]
+        vals=[cpp_string(x.get("id","dialog")),cpp_string(x.get("speaker","")),cpp_string(x.get("text","")),str(int(x.get("trigger",0))),str(int(x.get("weight",1))),str(int(x.get("reqFlag",0)))]
+        vals += [cpp_string(v) for v in choices]+[str(int(v)) for v in nxt]+[cpp_string(v) for v in eff]+[str(int(v)) for v in args]+[cpp_string(x.get("effectText",""))]
+        dialogs.append("{"+", ".join(vals)+"}")
+    lines.append(arr("MOD_DIALOGS","ModDialog",dialogs))
+    scenes=["{"+", ".join(str(int(x.get(k,d))) for k,d in [("plot",0),("dayMin",1),("dayMax",9999),("reqFlag",0),("dialogIdx",0),("weight",1)])+", "+cpp_string(x.get("title","Interlude"))+"}" for x in bundle.get("scenes",[])]
+    lines.append(arr("MOD_SCENES","ModScene",scenes))
+    lines.append(arr("MOD_RUMORS","ModRumor",["{"+str(int(x.get("plot",0)))+", "+str(int(x.get("stage",0)))+", "+cpp_string(x.get("text",""))+"}" for x in bundle.get("rumors",[])]))
+    lines.append(arr("MOD_FLAVOR","ModFlavor",["{"+str(int(x.get("weight",1) if isinstance(x,dict) else 1))+", "+cpp_string(x.get("text","") if isinstance(x,dict) else x)+"}" for x in bundle.get("flavor",[])]))
+    lines += [END,""]
+    return "\n".join(lines)
+
+def inject_zone(src,bundle):
+    zone=mod_zone(bundle)
+    if BEGIN in src and END in src:
+        a=src.index(BEGIN); b=src.index(END,a)+len(END)
+        return src[:a]+zone.rstrip()+src[b:]
+    if BEGIN in src or END in src: raise ValueError("Malformed mod-zone delimiters")
+    anchor="int main(int argc, char **argv) {"
+    p=src.find(anchor)
+    if p<0: raise ValueError("Cannot find main() anchor")
+    return src[:p]+zone+"\n"+src[p:]
+
+def validate(src,bundle):
+    errors=[]
+    if (BEGIN in src)!=(END in src): errors.append("Only one mod-zone delimiter is present.")
+    if BEGIN in src and src.count(BEGIN)!=1: errors.append("Duplicate mod-zone begin delimiter.")
+    if END in src and src.count(END)!=1: errors.append("Duplicate mod-zone end delimiter.")
+    checked = src[src.find(BEGIN):src.find(END)+len(END)] if BEGIN in src and END in src else ""
+    for pat in BANNED:
+        if re.search(pat,checked): errors.append("Banned C++ construct/include detected in mod zone: "+pat)
+    markers=PATCH_RE.findall(src)
+    if len(markers)!=len(set(markers)): errors.append("A MODPATCH marker appears more than once.")
+    for i,x in enumerate(bundle.get("enemies",[])):
+        if int(x.get("plot",0))<0 or int(x.get("plot",0))>7: errors.append(f"Enemy {i}: plot bitmask must be 0..7.")
+    for i,x in enumerate(bundle.get("scenes",[])):
+        if int(x.get("plot",-1)) not in (0,1,2): errors.append(f"Scene {i}: plot must be 0, 1, or 2.")
+        if not (0 <= int(x.get("dialogIdx",-1)) < len(bundle.get("dialogs",[]))): errors.append(f"Scene {i}: dialogIdx out of range.")
+    for i,x in enumerate(bundle.get("quests",[])):
+        for key,lim in (("enemyIdx",len(bundle.get("enemies",[]))),("dialogIdx",len(bundle.get("dialogs",[])))):
+            n=int(x.get(key,-1))
+            if n != -1 and not 0 <= n < lim: errors.append(f"Quest {i}: {key} out of range.")
+    for i,x in enumerate(bundle.get("dialogs",[])):
+        for n in x.get("next",[]):
+            if int(n) not in (-2,-1) and not 0 <= int(n) < len(bundle.get("dialogs",[])): errors.append(f"Dialogue {i}: next index {n} out of range.")
+    return errors
+
+def locate_vanilla_block(src, anchor, kind):
+    """Find an editable source block and return (start, end, exact source text)."""
+    pos = src.find(anchor)
+    # Backward compatibility: older Fiorencia builds used a fixed SPL name
+    # array instead of the extensible SpellDef catalog.
+    if pos < 0 and anchor == "static const SpellDef SPELLS[] = {":
+        legacy_anchor = "static const char *SPL["
+        legacy_pos = src.find(legacy_anchor)
+        if legacy_pos >= 0:
+            anchor = legacy_anchor
+            pos = legacy_pos
+    if pos < 0:
+        raise ValueError("Missing source anchor: " + anchor)
+    if kind == "line":
+        start = src.rfind("\n", 0, pos) + 1
+        end = src.find("\n", pos)
+        if end < 0: end = len(src)
+        else: end += 1
+        return start, end, src[start:end]
+    if kind == "function":
+        brace = src.find("{", pos)
+        if brace < 0: raise ValueError("Missing function body: " + anchor)
+        end = matching_brace_end(src, brace)
+        while end < len(src) and src[end] in " \t\r": end += 1
+        if end < len(src) and src[end] == "\n": end += 1
+        return pos, end, src[pos:end]
+    return parse_initializer(src, anchor)
+
+def apply_vanilla_edits(src, edits):
+    """Apply source edits against original offsets, from the end to avoid offset drift."""
+    ranges = []
+    for label, replacement in edits.items():
+        spec = next((x for x in VANILLA_BLOCKS if x[0] == label), None)
+        if spec is None: raise ValueError("Unknown vanilla block: " + label)
+        start, end, original = locate_vanilla_block(src, spec[1], spec[2])
+        if start < end: ranges.append((start, end, replacement, label))
+    ranges.sort(key=lambda x: x[0])
+    for a, b in zip(ranges, ranges[1:]):
+        if a[1] > b[0]: raise ValueError("Overlapping source edits: " + a[3] + " / " + b[3])
+    for start, end, replacement, label in reversed(ranges):
+        src = src[:start] + replacement + src[end:]
+    return src
+
+DEVPATCH_BEGIN_RE = re.compile(
+    r"// \[DEVPATCH:([A-Za-z0-9_-]+):(before|after):([A-Za-z0-9_-]+):BEGIN\]\n(.*?)// \[DEVPATCH:\1:END\]\n?",
+    re.DOTALL,
+)
+
+
+def _anchor_encode(anchor):
+    return base64.urlsafe_b64encode(anchor.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _anchor_decode(value):
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode("utf-8")
+
+
+def parse_dev_patches(src):
+    """Read editable source patches embedded in the C++ file itself."""
+    patches = []
+    for m in DEVPATCH_BEGIN_RE.finditer(src):
+        try:
+            anchor = _anchor_decode(m.group(3))
+        except Exception:
+            continue
+        patches.append({"id": m.group(1), "position": m.group(2), "anchor": anchor,
+                        "code": m.group(4).rstrip("\r\n")})
+    return patches
+
+
+def strip_dev_patches(src):
+    # An "after" patch adds one separator newline before its marker; remove that
+    # separator too, otherwise every open/save cycle would accumulate blank lines.
+    pieces = []
+    cursor = 0
+    for match in DEVPATCH_BEGIN_RE.finditer(src):
+        prefix = src[cursor:match.start()]
+        if match.group(2) == "after" and prefix.endswith("\n"):
+            prefix = prefix[:-1]
+        pieces.append(prefix)
+        cursor = match.end()
+    pieces.append(src[cursor:])
+    return "".join(pieces)
+
+
+def apply_dev_patches(src, patches):
+    """Apply named, idempotent insertions. Each anchor must exist exactly once."""
+    base = strip_dev_patches(src)
+    seen = set()
+    for patch in patches:
+        pid = str(patch.get("id", "")).strip()
+        anchor = str(patch.get("anchor", ""))
+        position = patch.get("position", "before")
+        code = str(patch.get("code", "")).rstrip("\r\n")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", pid):
+            raise ValueError(f"Invalid patch id {pid!r}; use letters, digits, _ or - (max 48).")
+        if pid in seen:
+            raise ValueError(f"Duplicate development patch id: {pid}")
+        seen.add(pid)
+        if not anchor or base.count(anchor) != 1:
+            count = base.count(anchor) if anchor else 0
+            raise ValueError(f"Patch {pid}: anchor must occur exactly once in source (found {count}).")
+        if position not in ("before", "after"):
+            raise ValueError(f"Patch {pid}: position must be before or after.")
+        if not code.strip():
+            raise ValueError(f"Patch {pid}: code cannot be empty.")
+        block = (f"// [DEVPATCH:{pid}:{position}:{_anchor_encode(anchor)}:BEGIN]\n"
+                 f"{code}\n// [DEVPATCH:{pid}:END]\n")
+        idx = base.find(anchor)
+        if position == "before":
+            base = base[:idx] + block + base[idx:]
+        else:
+            end = idx + len(anchor)
+            base = base[:end] + "\n" + block + base[end:]
+    return base
+
+
+def lexical_cpp_check(src):
+    """Small lexer for delimiter/string sanity; not a C++ parser."""
+    state = "code"; stack = []; i = 0; line = 1
+    pairs = {"}": "{", ")": "(", "]": "["}
+    while i < len(src):
+        c = src[i]; n = src[i + 1] if i + 1 < len(src) else ""
+        if c == "\n": line += 1
+        if state == "code":
+            if c == '"': state = "string"
+            elif c == "'": state = "char"
+            elif c == "/" and n == "/": state = "line"; i += 1
+            elif c == "/" and n == "*": state = "block"; i += 1
+            elif c in "{([": stack.append((c, line))
+            elif c in "})]":
+                if not stack or stack[-1][0] != pairs[c]:
+                    return [f"Unexpected {c!r} on line {line}."]
+                stack.pop()
+        elif state == "string":
+            if c == "\\": i += 1
+            elif c == '"': state = "code"
+        elif state == "char":
+            if c == "\\": i += 1
+            elif c == "'": state = "code"
+        elif state == "line":
+            if c == "\n": state = "code"
+        elif state == "block":
+            if c == "*" and n == "/": state = "code"; i += 1
+        i += 1
+    errors = []
+    if state in ("string", "char", "block"):
+        errors.append(f"Unterminated C++ {state} literal/comment.")
+    if stack:
+        errors.append(f"Unclosed delimiter {stack[-1][0]!r} opened on line {stack[-1][1]}.")
+    return errors
+
+
+def validate_workbench_source(src, bundle):
+    errors = list(validate(src, bundle))
+    errors.extend(lexical_cpp_check(src))
+    patches = parse_dev_patches(src)
+    ids = [p["id"] for p in patches]
+    if len(ids) != len(set(ids)): errors.append("Duplicate development patch IDs.")
+    for patch in patches:
+        for pattern in BANNED:
+            if re.search(pattern, patch["code"]):
+                errors.append(f"Patch {patch['id']}: forbidden construct detected ({pattern}).")
+    return list(dict.fromkeys(errors))
+
+
+FEATURE_TEMPLATES = {
+    "Custom patch": {"id": "custom_feature", "position": "before", "anchor": "int main(int argc, char **argv) {", "code": "// Add your C++ helper function or hook here.\n// Keep compatibility with -fno-exceptions -fno-rtti and the game's stdio-only rules."},
+    "Rare patron quest event": {"id": "rare_patron_event", "position": "before", "anchor": "Eco c = climate(P);", "code": "// Additional gameplay-loop event: a rare patron contract.\nif (d(20) == 1) {\n    const int reward = 25;\n    P.df += reward;\n    say(\"MOD EVENT: a patron pays you 2.5 florins for a discreet errand.\");\n    return;\n}"},
+    "Day-cycle milestone reward": {"id": "day_cycle_reward", "position": "before", "anchor": "P.day++;", "code": "// Additional day-cycle milestone: a modest stipend every 10 completed days.\nif (P.day > 0 && P.day % 10 == 0) {\n    P.p += 15;\n    notes.push_back(\"MOD EVENT: a guild stipend arrives (+15p).\");\n}"},
+    "New player command (inspect)": {"id": "inspect_command", "position": "before", "anchor": 'else if (cmd == "3" || cmd == "exchange" || cmd == "x") doExchange(P, arg);', "code": 'else if (cmd == "inspect") say("You take a careful look around the piazza. The city has more stories than it admits.");'},
+}
+
+
+def selftest(path):
+    src = Path(path).read_text(encoding="utf-8")
+    errors = lexical_cpp_check(src)
+    base = strip_dev_patches(src)
+    for label, anchor, kind in VANILLA_BLOCKS:
+        try:
+            locate_vanilla_block(base, anchor, kind)
+        except ValueError as e:
+            errors.append(f"{label}: {e}")
+    if base.count(BEGIN) != base.count(END): errors.append("Unbalanced mod-zone delimiters.")
+    if base.count(BEGIN) > 1 or base.count(END) > 1: errors.append("Duplicate mod-zone delimiters.")
+    markers = PATCH_RE.findall(src)
+    if len(markers) != len(set(markers)): errors.append("Duplicate MODPATCH marker(s).")
+    dev_ids = [x["id"] for x in parse_dev_patches(src)]
+    if len(dev_ids) != len(set(dev_ids)): errors.append("Duplicate DEVPATCH ids.")
+    # Verify source patches can be stripped and re-applied without changing their content.
+    try:
+        rebuilt = apply_dev_patches(base, parse_dev_patches(src))
+        if strip_dev_patches(rebuilt) != base: errors.append("Development patch round-trip changed unpatched source.")
+    except ValueError as e:
+        errors.append(str(e))
+    if errors:
+        print("SELFTEST FAIL")
+        for e in errors: print(" -", e)
+        return 1
+    print("SELFTEST OK: source anchors, lexical delimiters, patch IDs, and patch round-trip checks passed.")
+    print("Note: this is a structural check, not a C++ compile or gameplay test.")
+    return 0
+
+
+# ============================================================================
+#  WORKBENCH UI  (v2.3)
+#
+#  Everything ABOVE this banner is the unchanged source-editing engine
+#  (anchors, mod-zone generator, DEVPATCH markers, validators, selftest). The
+#  UI below only drives those functions, so files written by earlier versions
+#  of the workbench -- and fiorencia.cpp itself -- stay fully compatible.
+# ============================================================================
+import codecs, contextlib, hashlib, io
+
+WORKBENCH_VERSION = "2.3"
+SETTINGS_PATH = Path.home() / ".fiorencia_modder.json"
+BUNDLE_FORMAT = DEFAULT_BUNDLE["format"]
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+DIAG_RE = re.compile(r"^(?P<file>.+?):(?P<line>\d+):(?P<col>\d+):\s*(?P<kind>fatal error|error|warning|note)")
+
+TAB_DEFS = (("vanilla", "1 Existing Content"), ("tuning", "2 Tuning"), ("mods", "3 Mod Content"),
+            ("wizard", "4 Item Wizard"), ("features", "5 Gameplay Patches"), ("review", "6 Review"),
+            ("build", "7 Build & Test"), ("raw", "8 Preview / Diff"))
+
+ROW_DEFAULTS = {
+    "items": {"key": "new_item", "name": "New item", "cost": 10, "flor": True, "kind": 5, "subtype": "heal", "arg": 3, "qty": 1, "reqFlag": 0, "desc": ""},
+    "enemies": {"name": "New enemy", "hp": 12, "maxhp": 12, "def": 10, "atk": 3, "sides": 6, "bonus": 0, "rewardP": 20, "rewardDf": 0, "plot": 0, "context": "generic", "weight": 1, "beatIdx": -1},
+    "quests": {"name": "New quest", "archetype": "patron", "weight": 1, "reqClass": -1, "reqPlot": -1, "reqDayMin": 1, "reqDayMax": 9999, "reqFlag": 0, "rewardP": 0, "rewardDf": 0, "grantFlag": 0, "enemyIdx": -1, "dialogIdx": -1, "sayIntro": "", "sayOk": "", "sayFail": ""},
+    "dialogs": {"id": "new_dialog", "speaker": "Speaker", "text": "Dialogue text", "trigger": 1, "weight": 1, "reqFlag": 0, "choice": ["Leave", "", ""], "next": [-1, -1, -1], "effect": ["none"] * 3, "effectArg": [0] * 3, "effectText": ""},
+    "scenes": {"plot": 0, "dayMin": 25, "dayMax": 25, "reqFlag": 0, "dialogIdx": 0, "title": "New interlude", "weight": 1},
+    "rumors": {"plot": 0, "stage": 0, "text": "New rumor."},
+    "flavor": {"weight": 1, "text": ""},
+}
+SINGULAR = {"items": "item", "enemies": "enemy", "quests": "quest", "dialogs": "dialogue", "scenes": "scene", "rumors": "rumor", "flavor": "flavor line"}
+TEXT_FIELDS = {"text", "desc", "sayIntro", "sayOk", "sayFail", "effectText"}
+RECORD_HINTS = {
+    "items": "kind mirrors the SHOP table: 0 weapon, 1 armor, 2 spell, 3 rations, 4 herbs (5 = consumable, mod-only). flor=true prices in florins.",
+    "enemies": "plot is a bitmask 0..7 (validated). beatIdx -1 = not tied to a story beat.",
+    "quests": "enemyIdx / dialogIdx are row numbers (#) from the Enemies / Dialogue tables; -1 means none.",
+    "dialogs": "choice / next / effect / effectArg are 3-entry JSON lists. next values are Dialogue row numbers (#); -1 ends the conversation.",
+    "scenes": "plot: 0 revolt, 1 plague, 2 Albizzi. dialogIdx is a Dialogue row number (#).",
+    "rumors": "plot 0..2, stage 0..3 (matches RUMOR[plot][stage] in the game).",
+}
+
+TUNING_DEFAULTS = {"LEGACY_DF": 5000, "LEGACY_SPREAD": 10, "WAGE_PCT": 160, "INCOME_PCT": 200, "UPKEEP_BASE": 110, "UPKEEP_RISE": 4, "UPKEEP_WEALTH": 300, "CRAFT_K": 50, "CRAFT_STEP": 15,
+    "CRAFT_MAT[0]": 40, "CRAFT_MAT[1]": 50, "CRAFT_MAT[2]": 60, "CRAFT_MAT[3]": 60, "CRAFT_TOOLS[0]": 80, "CRAFT_TOOLS[1]": 200, "CRAFT_TOOLS[2]": 450,
+    "START_P[0]": 550, "START_P[1]": 250, "START_P[2]": 400, "START_DF[0]": 30, "START_DF[1]": 40, "START_DF[2]": 40, "BEAT_DAY[0]": 10, "BEAT_DAY[1]": 50, "BEAT_DAY[2]": 100}
+CLASS_NAMES = ("Artisan", "Knight", "Scholar")
+TUNING_GROUPS = (
+    ("Economy", [("LEGACY_DF", "legacy price, tenths of a florin"), ("LEGACY_SPREAD", "% the ending moves the price"),
+                 ("WAGE_PCT", "work wage, %"), ("INCOME_PCT", "study / craft / patron / loot income, %"),
+                 ("UPKEEP_BASE", "cost of living on day 1 (p)"), ("UPKEEP_RISE", "added p per 10 days"),
+                 ("UPKEEP_WEALTH", "tenths of florin per +1p upkeep")]),
+    ("Crafting", [("CRAFT_K", "sales base"), ("CRAFT_STEP", "sales bonus per rank")] +
+                 [("CRAFT_MAT[%d]" % i, "materials (p) at rank %d" % i) for i in range(4)] +
+                 [("CRAFT_TOOLS[%d]" % i, "tools for rank %d (tenths of f)" % (i + 1)) for i in range(3)]),
+    ("Starting purse", [("START_P[%d]" % i, "%s, piccioli" % CLASS_NAMES[i]) for i in range(3)] +
+                       [("START_DF[%d]" % i, "%s, tenths of f" % CLASS_NAMES[i]) for i in range(3)]),
+    ("Story calendar", [("BEAT_DAY[%d]" % i, "story beat %d plays on day" % (i + 1)) for i in range(3)]),
+)
+TUNING_SCALAR = {"LEGACY_DF": "Legacy price", "LEGACY_SPREAD": "Legacy price spread", "WAGE_PCT": "Wage multiplier",
+                 "INCOME_PCT": "Income multiplier", "UPKEEP_BASE": "Base upkeep", "UPKEEP_RISE": "Upkeep rise",
+                 "UPKEEP_WEALTH": "Wealth upkeep divisor", "CRAFT_K": "Craft multiplier", "CRAFT_STEP": "Craft rank step"}
+TUNING_ARRAYS = {"CRAFT_MAT": "Craft materials", "CRAFT_TOOLS": "Craft tools", "START_P": "Starting money",
+                 "START_DF": "Starting florins", "BEAT_DAY": "Story beat days"}
+ARG_PRESETS = ["--plain", "--plain --seed 1", "--plain --plot 0 --day 9", "--plain --plot 1 --day 49", "--plain --plot 2 --day 99", "--amber"]
+SHORTCUTS = ("Ctrl+S  Save (source, plus designs/bundle sidecars)\nCtrl+1 … Ctrl+8  Jump to tab\nCtrl+Enter  Apply the block in Existing Content / apply a record dialog\n"
+             "F5  Build release     Shift+F5  Build debug\nF6  Validate (jump to Review)\nF7  Launch built game     F8  Build & run\n"
+             "Ctrl+F / Ctrl+G  Find / go to line in Preview\nDouble-click a g++ error line  Jump to that line in Preview\n"
+             "In mod tables: Enter/double-click edit, Del delete, Ctrl+D duplicate, Ctrl+Z undo last mod-data change")
+
+
+# ---------------------------------------------------------------- pure helpers
+def read_source_text(path):
+    """Return (LF-normalised text, original eol, raw bytes). Line endings are restored on save."""
+    raw = Path(path).read_bytes()
+    text = raw.decode("utf-8")
+    return text.replace("\r\n", "\n"), ("\r\n" if "\r\n" in text else "\n"), raw
+
+
+def to_disk_text(text, eol):
+    return text.replace("\n", eol) if eol != "\n" else text
+
+
+def iter_refs(bundle, kind):
+    """Yield (container, key) for every cross-table index that points at `kind` rows."""
+    if kind == "enemies":
+        for q in bundle.get("quests", []):
+            if isinstance(q, dict) and "enemyIdx" in q: yield q, "enemyIdx"
+    elif kind == "dialogs":
+        for sec in ("quests", "scenes"):
+            for r in bundle.get(sec, []):
+                if isinstance(r, dict) and "dialogIdx" in r: yield r, "dialogIdx"
+        for dlg in bundle.get("dialogs", []):
+            nx = dlg.get("next") if isinstance(dlg, dict) else None
+            if isinstance(nx, list):
+                for k in range(len(nx)): yield nx, k
+
+
+def _as_int(v):
+    try: return int(v)
+    except (TypeError, ValueError): return None
+
+
+def count_refs(bundle, kind, idx):
+    return sum(1 for c, k in iter_refs(bundle, kind) if _as_int(c[k]) == idx)
+
+
+def remap_bundle_refs(bundle, kind, mapping):
+    """mapping: old row -> new row (None = row deleted -> reference cleared to -1). Returns #refs changed."""
+    changed = 0
+    for c, k in list(iter_refs(bundle, kind)):
+        v = _as_int(c[k])
+        if v is None or v < 0 or v not in mapping: continue
+        nv = mapping[v]
+        nv = -1 if nv is None else nv
+        if nv != v: c[k] = nv; changed += 1
+    return changed
+
+
+def delete_mapping(n, idx):
+    return {i: (None if i == idx else (i - 1 if i > idx else i)) for i in range(n)}
+
+
+def swap_mapping(i, j):
+    return {i: j, j: i}
+
+
+def diff_counts(text):
+    a = d = 0
+    for ln in text.splitlines():
+        if ln.startswith("+") and not ln.startswith("+++"): a += 1
+        elif ln.startswith("-") and not ln.startswith("---"): d += 1
+    return a, d
+
+
+def hint_for(err):
+    e = err.lower()
+    if "banned c++" in e or "forbidden construct" in e:
+        return "Remove try/catch/throw, <iostream>/<fstream>/<sstream>, stoi-style calls or .at(). See BUILD NOTES at the top of the currently open C++ source."
+    if "scene" in e and "plot must be" in e: return "Scenes use plot 0 (revolt), 1 (plague) or 2 (Albizzi)."
+    if "dialogidx out of range" in e or "next index" in e:
+        return "Open Mod Content > Dialogue and use the # column: indices are row numbers; -1 ends a conversation."
+    if "enemyidx out of range" in e: return "Open Mod Content > Enemies and use the # column; -1 means no enemy."
+    if "plot bitmask" in e: return "Enemy plot is a bitmask in the range 0..7."
+    if "anchor must occur exactly once" in e: return "Edit the anchor in Gameplay Patches and use 'Check anchor' to see how often it matches."
+    if "unclosed delimiter" in e or "unexpected" in e:
+        return "Check braces/parentheses in your Existing Content edits or patch code; Preview / Diff shows the generated source."
+    if "unterminated" in e: return "A string, character literal or /* comment is not closed."
+    if "modpatch" in e: return "Each // [MODPATCH:id] marker may appear only once."
+    if "mod-zone" in e or "mod zone" in e: return "The MOD ZONE BEGIN / END comment lines must each appear exactly once."
+    if "duplicate development patch" in e: return "Give every gameplay patch a unique ID."
+    return ""
+
+
+def load_settings():
+    try: return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception: return {}
+
+
+def save_settings(data):
+    try: SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception: pass
+
+
+# ---------------------------------------------------------------- widgets
+class Tip:
+    """Minimal hover tooltip."""
+    def __init__(self, widget, text):
+        self.w, self.text, self.tw, self.job = widget, text, None, None
+        widget.bind("<Enter>", self._enter, add="+"); widget.bind("<Leave>", self._leave, add="+")
+        widget.bind("<ButtonPress>", self._leave, add="+")
+
+    def _enter(self, _e=None):
+        self._leave(); self.job = self.w.after(550, self._show)
+
+    def _show(self):
+        if self.tw: return
+        self.tw = tk.Toplevel(self.w); self.tw.wm_overrideredirect(True)
+        self.tw.wm_geometry("+%d+%d" % (self.w.winfo_rootx() + 8, self.w.winfo_rooty() + self.w.winfo_height() + 4))
+        tk.Label(self.tw, text=self.text, background="#ffffe0", foreground="#000000", relief="solid", borderwidth=1, padx=5, pady=2, justify="left").pack()
+
+    def _leave(self, _e=None):
+        if self.job: self.w.after_cancel(self.job); self.job = None
+        if self.tw: self.tw.destroy(); self.tw = None
+
+
+def scrolled_text(parent, wrap="none", **kw):
+    """Text widget with proper scrollbars, returned as (container frame, text)."""
+    frame = ttk.Frame(parent)
+    txt = tk.Text(frame, wrap=wrap, **kw)
+    ys = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
+    txt.configure(yscrollcommand=ys.set)
+    txt.grid(row=0, column=0, sticky="nsew"); ys.grid(row=0, column=1, sticky="ns")
+    if wrap == "none":
+        xs = ttk.Scrollbar(frame, orient="horizontal", command=txt.xview)
+        txt.configure(xscrollcommand=xs.set); xs.grid(row=1, column=0, sticky="ew")
+    frame.rowconfigure(0, weight=1); frame.columnconfigure(0, weight=1)
+    return frame, txt
+
+
+def config_diff_tags(w):
+    w.tag_configure("add", background="#d7f5d7"); w.tag_configure("del", background="#fadada")
+    w.tag_configure("hdr", foreground="#1a4f8b", font=("TkFixedFont", 9, "bold")); w.tag_configure("hunk", foreground="#7b2c9e", background="#efe6f7")
+    w.tag_configure("find", background="#ffe066"); w.tag_configure("target", background="#ffd0a0")
+
+
+def colorize_diff(w, text):
+    for i, line in enumerate(text.split("\n"), 1):
+        tag = ("hdr" if line.startswith(("+++", "---")) else "hunk" if line.startswith("@@") else
+               "add" if line.startswith("+") else "del" if line.startswith("-") else None)
+        if tag: w.tag_add(tag, "%d.0" % i, "%d.end" % i)
+
+
+class RecordDialog(tk.Toplevel):
+    """Form editor for one mod-data record, with a raw-JSON escape hatch. Field types follow the record."""
+    def __init__(self, parent, title, record, defaults, on_apply, hint=""):
+        super().__init__(parent)
+        self.title(title); self.transient(parent); self.geometry("780x660")
+        self.defaults, self.on_apply, self.mode = defaults, on_apply, "form"
+        self.vars, self.kinds, self.texts = {}, {}, {}
+        if hint: ttk.Label(self, text=hint, style="Muted.TLabel", wraplength=740, justify="left").pack(anchor="w", padx=10, pady=(8, 2))
+        self.holder = ttk.Frame(self); self.holder.pack(fill="both", expand=True, padx=8, pady=4)
+        self.form_box = ttk.Frame(self.holder)
+        self.canvas = tk.Canvas(self.form_box, highlightthickness=0)
+        sb = ttk.Scrollbar(self.form_box, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y"); self.canvas.pack(side="left", fill="both", expand=True)
+        self.form = ttk.Frame(self.canvas); self.form.columnconfigure(1, weight=1)
+        self.canvas.create_window((0, 0), window=self.form, anchor="nw", tags=("form",))
+        self.form.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure("form", width=e.width))
+        self.json_box, self.json_text = scrolled_text(self.holder, font=("TkFixedFont", 10), undo=True)
+        self.form_box.pack(fill="both", expand=True)
+        row = ttk.Frame(self); row.pack(fill="x", padx=8, pady=8)
+        ttk.Button(row, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(row, text="Apply (Ctrl+Enter)", command=self.apply).pack(side="right", padx=5)
+        self.toggle_btn = ttk.Button(row, text="Edit as JSON", command=self.toggle_mode); self.toggle_btn.pack(side="left")
+        ttk.Button(row, text="Reset to defaults", command=self.reset_defaults).pack(side="left", padx=5)
+        self._build_form(record)
+        self.bind("<Control-Return>", lambda e: (self.apply(), "break")[1]); self.bind("<Escape>", lambda e: self.destroy())
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"): self.bind_all(seq, self._on_wheel)
+        self.bind("<Destroy>", self._on_destroy)
+        self.after(60, self._grab)
+
+    def _grab(self):
+        try: self.grab_set(); self.focus_set()
+        except tk.TclError: pass
+
+    def _on_destroy(self, e):
+        if e.widget is self:
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"): self.unbind_all(seq)
+
+    def _on_wheel(self, e):
+        if self.mode != "form": return
+        step = -1 if (e.num == 4 or (e.num not in (4, 5) and e.delta > 0)) else 1
+        self.canvas.yview_scroll(step, "units")
+
+    def _build_form(self, rec):
+        for w in self.form.winfo_children(): w.destroy()
+        self.vars, self.kinds, self.texts = {}, {}, {}
+        keys = [k for k in self.defaults if k in rec] + [k for k in rec if k not in self.defaults]
+        for r, k in enumerate(keys):
+            v = rec[k]
+            ttk.Label(self.form, text=k, width=16, anchor="w").grid(row=r, column=0, sticky="nw", padx=(2, 6), pady=3)
+            if isinstance(v, bool):
+                var = tk.BooleanVar(value=v); ttk.Checkbutton(self.form, variable=var).grid(row=r, column=1, sticky="w"); kind = "bool"
+            elif isinstance(v, int):
+                var = tk.StringVar(value=str(v)); ttk.Entry(self.form, textvariable=var).grid(row=r, column=1, sticky="ew"); kind = "int"
+            elif isinstance(v, float):
+                var = tk.StringVar(value=str(v)); ttk.Entry(self.form, textvariable=var).grid(row=r, column=1, sticky="ew"); kind = "float"
+            elif isinstance(v, str):
+                kind = "str"; var = tk.StringVar(value=v)
+                if k in TEXT_FIELDS:
+                    t = tk.Text(self.form, height=3, wrap="word", font=("TkDefaultFont", 9)); t.insert("1.0", v)
+                    t.grid(row=r, column=1, sticky="ew"); self.texts[k] = t
+                else: ttk.Entry(self.form, textvariable=var).grid(row=r, column=1, sticky="ew")
+            else:
+                kind = "json"; var = tk.StringVar(value=json.dumps(v, ensure_ascii=False))
+                ttk.Entry(self.form, textvariable=var).grid(row=r, column=1, sticky="ew")
+            self.vars[k], self.kinds[k] = var, kind
+
+    def _collect_form(self):
+        rec, errs = {}, []
+        for k, kind in self.kinds.items():
+            raw = self.vars[k].get()
+            if kind == "bool": rec[k] = bool(raw)
+            elif kind == "str": rec[k] = self.texts[k].get("1.0", "end-1c") if k in self.texts else raw
+            elif kind in ("int", "float"):
+                try: rec[k] = int(str(raw).strip()) if kind == "int" else float(str(raw).strip())
+                except ValueError: errs.append("%s: %s required" % (k, "whole number" if kind == "int" else "number"))
+            else:
+                try: rec[k] = json.loads(raw)
+                except ValueError as e: errs.append("%s: invalid JSON (%s)" % (k, e))
+        return rec, errs
+
+    def _collect_json(self):
+        try:
+            val = json.loads(self.json_text.get("1.0", "end-1c"))
+            if not isinstance(val, dict): raise ValueError("record must be a JSON object")
+            return val, []
+        except ValueError as e:
+            return None, ["JSON: " + str(e)]
+
+    def toggle_mode(self):
+        if self.mode == "form":
+            rec, errs = self._collect_form()
+            if errs: messagebox.showerror("Fix these fields", "\n".join(errs), parent=self); return
+            self.form_box.pack_forget(); self.json_box.pack(fill="both", expand=True)
+            self.json_text.delete("1.0", "end"); self.json_text.insert("1.0", json.dumps(rec, indent=2, ensure_ascii=False))
+            self.mode = "json"; self.toggle_btn.config(text="Edit as form")
+        else:
+            rec, errs = self._collect_json()
+            if errs: messagebox.showerror("Invalid JSON", "\n".join(errs), parent=self); return
+            self._build_form(rec); self.json_box.pack_forget(); self.form_box.pack(fill="both", expand=True)
+            self.mode = "form"; self.toggle_btn.config(text="Edit as JSON")
+
+    def reset_defaults(self):
+        if not self.defaults: return
+        rec = copy.deepcopy(self.defaults)
+        if self.mode == "form": self._build_form(rec)
+        else: self.json_text.delete("1.0", "end"); self.json_text.insert("1.0", json.dumps(rec, indent=2, ensure_ascii=False))
+
+    def apply(self):
+        rec, errs = self._collect_form() if self.mode == "form" else self._collect_json()
+        if errs: messagebox.showerror("Cannot apply", "\n".join(errs), parent=self); return
+        self.on_apply(rec); self.destroy()
+
+
+class Editor(tk.Tk):
+    def __init__(self, path=None):
+        super().__init__()
+        self.settings = load_settings()
+        self.path = None; self.disk = ""; self.eol = "\n"; self.disk_bytes = b""; self.disk_mtime = None
+        self.bundle = {k: [] for k in SECTIONS}; self.bundle_history = []; self.bundle_file = None; self.zone_ack = False
+        self.vanilla_edits = {}; self.current_vanilla_label = None; self.vanilla_loaded_text = ""; self.vanilla_original = ""; self.vanilla_visible = []
+        self.dev_patches = []; self.dirty = False; self.saved_at = "never"; self.session_backup_done = False
+        self.proc = None; self.output_queue = queue.Queue(); self.built_binary = None; self.build_running = False
+        self.build_hash = None; self.run_after_build = False; self.build_state = "No build yet"; self.game_history = []; self.game_hist_pos = 0
+        self.designs = []; self.design_dirty = False; self.current_design_index = None; self._loading_design = False
+        self._rev = 0; self._preview_cache = (None, None, None); self._validation_cache = (None, None)
+        self._raw_key = None; self._find_pos = "1.0"; self._status_default = ""; self._flash_job = None; self._hl_job = None
+        self._last_focus_check = 0.0; self._ext_warned = False; self.selftest_output = ""
+        self.tables = {}; self.tabs = {}; self.mod_tabs = {}; self.raw = None
+        self.diffvar = tk.BooleanVar(value=bool(self.settings.get("diff", False)))
+        self.title("Fiorencia Development Workbench")
+        try: self.geometry(self.settings.get("geometry") or "1240x820")
+        except tk.TclError: self.geometry("1240x820")
+        self.minsize(900, 600)
+        self._style(); self._menu(); self._toolbar(); self._statusbar()
+        self.nb = ttk.Notebook(self); self.nb.pack(fill="both", expand=True, padx=8, pady=(2, 4))
+        builders = {"vanilla": self._vanilla_tab, "tuning": self._tuning_tab, "mods": self._mods_tab, "wizard": self._item_wizard_tab,
+                    "features": self._features_tab, "review": self._review_tab, "build": self._build_tab, "raw": self._raw_tab}
+        for key, label in TAB_DEFS:
+            frame = ttk.Frame(self.nb); self.nb.add(frame, text=label); self.tabs[key] = frame; builders[key](frame)
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self._bind_keys()
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+        self.bind("<FocusIn>", self._on_focus)
+        self.after(100, self._poll_process_output)
+        target = path or self._default_source()
+        if target: self.load_file(target)
+        else:
+            self.update_status(); self.flash("Open a Fiorencia C++ source file (File > Open) to begin.", 20000)
+
+    # ------------------------------------------------------------ chrome
+    def _style(self):
+        st = ttk.Style(self)
+        try:
+            if self.tk.call("tk", "windowingsystem") == "x11" and "clam" in st.theme_names(): st.theme_use("clam")
+        except tk.TclError: pass
+        st.configure("Treeview", rowheight=22)
+        st.configure("Dirty.TLabel", foreground="#b00020"); st.configure("Clean.TLabel", foreground="#2e7d32")
+        st.configure("Muted.TLabel", foreground="#666666"); st.configure("Head.TLabel", font=("TkDefaultFont", 10, "bold"))
+
+    def _menu(self):
+        m = tk.Menu(self)
+        f = tk.Menu(m, tearoff=False)
+        f.add_command(label="Open…", command=self.open_file)
+        self.recent_menu = tk.Menu(f, tearoff=False); f.add_cascade(label="Open Recent", menu=self.recent_menu)
+        f.add_command(label="Save", accelerator="Ctrl+S", command=self.save); f.add_command(label="Save As…", command=self.save_as)
+        f.add_command(label="Reload from disk", command=self.reload); f.add_separator()
+        f.add_command(label="Load Mod Bundle…", command=self.load_bundle); f.add_command(label="Save Mod Bundle…", command=self.save_bundle)
+        f.add_command(label="Insert sample bundle", command=self.insert_sample_bundle); f.add_command(label="Clear mod data", command=self.clear_bundle)
+        f.add_separator(); f.add_command(label="Quit", command=self.quit_app)
+        m.add_cascade(label="File", menu=f)
+        e = tk.Menu(m, tearoff=False)
+        e.add_command(label="Undo last mod-data change", command=self.undo_bundle)
+        e.add_command(label="Revert to latest .bak", command=self.revert); e.add_separator()
+        e.add_command(label="Validate source", accelerator="F6", command=self.validate_project)
+        e.add_command(label="View diff vs. disk", command=self.show_diff)
+        m.add_cascade(label="Edit", menu=e)
+        v = tk.Menu(m, tearoff=False)
+        for i, (key, label) in enumerate(TAB_DEFS, 1): v.add_command(label=label, accelerator="Ctrl+%d" % i, command=lambda k=key: self.select_tab(k))
+        m.add_cascade(label="View", menu=v)
+        b = tk.Menu(m, tearoff=False)
+        b.add_command(label="Build release", accelerator="F5", command=lambda: self.build_game(False))
+        b.add_command(label="Build debug", accelerator="Shift+F5", command=lambda: self.build_game(True))
+        b.add_command(label="Build & run", accelerator="F8", command=lambda: self.build_game(False, True))
+        b.add_command(label="Launch built game", accelerator="F7", command=self.launch_game); b.add_command(label="Stop game", command=self.stop_process)
+        m.add_cascade(label="Build", menu=b)
+        h = tk.Menu(m, tearoff=False)
+        h.add_command(label="Keyboard shortcuts", command=lambda: messagebox.showinfo("Keyboard shortcuts", SHORTCUTS, parent=self))
+        h.add_command(label="About", command=lambda: messagebox.showinfo("About", "Fiorencia Development Workbench %s\nPython + Tkinter source editor.\nIt edits the currently open Fiorencia C++ source in place; compiling is an explicit action." % WORKBENCH_VERSION, parent=self))
+        m.add_cascade(label="Help", menu=h)
+        self.config(menu=m); self._rebuild_recent()
+
+    def _rebuild_recent(self):
+        self.recent_menu.delete(0, "end")
+        recent = [p for p in self.settings.get("recent", []) if Path(p).exists()]
+        if not recent: self.recent_menu.add_command(label="(none)", state="disabled")
+        for p in recent: self.recent_menu.add_command(label=p, command=lambda p=p: self._open_path(p))
+
+    def _toolbar(self):
+        bar = ttk.Frame(self); bar.pack(fill="x", padx=8, pady=(6, 2))
+        def btn(text, cmd, tip):
+            b = ttk.Button(bar, text=text, command=cmd); b.pack(side="left", padx=2); Tip(b, tip); return b
+        btn("Open…", self.open_file, "Open a Fiorencia C++ source file"); btn("Save", self.save, "Save (Ctrl+S). A .bak copy is written first.")
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
+        btn("Validate", self.validate_project, "Static checks, shown in the Review tab (F6)"); btn("Diff", self.show_diff, "Show every pending change vs. the file on disk")
+        self.tb_build = btn("Build + Run", lambda: self.build_game(False, True), "Build release and launch it (F8)")
+        self.dirtylabel = ttk.Label(bar, text="● Saved", style="Clean.TLabel"); self.dirtylabel.pack(side="left", padx=12)
+        self.filelabel = ttk.Label(bar, text="No source file", style="Muted.TLabel"); self.filelabel.pack(side="left", fill="x", expand=True)
+
+    def _statusbar(self):
+        f = ttk.Frame(self, relief="sunken", borderwidth=1); f.pack(fill="x", side="bottom")
+        self.status = ttk.Label(f, anchor="w"); self.status.pack(side="left", fill="x", expand=True, padx=6)
+        self.status_right = ttk.Label(f, anchor="e", style="Muted.TLabel"); self.status_right.pack(side="right", padx=6)
+
+    def _bind_keys(self):
+        def k(fn): return lambda e: (fn(), "break")[1]
+        self.bind_all("<Control-s>", k(self.save)); self.bind_all("<F5>", k(lambda: self.build_game(False)))
+        self.bind_all("<Shift-F5>", k(lambda: self.build_game(True))); self.bind_all("<F6>", k(self.validate_project))
+        self.bind_all("<F7>", k(self.launch_game)); self.bind_all("<F8>", k(lambda: self.build_game(False, True)))
+        for i, (key, _l) in enumerate(TAB_DEFS, 1): self.bind_all("<Control-Key-%d>" % i, k(lambda key=key: self.select_tab(key)))
+
+    def select_tab(self, key):
+        self.nb.select(self.tabs[key])
+
+    def _current_tab_key(self):
+        try: cur = str(self.nb.select())
+        except Exception: return None
+        for k, f in self.tabs.items():
+            if str(f) == cur: return k
+        return None
+
+    def _on_tab_changed(self, _e=None):
+        key = self._current_tab_key()
+        if key == "raw": self.refresh_raw()
+        elif key == "review": self.refresh_review()
+
+    def flash(self, msg, ms=6000):
+        self.status.config(text=msg)
+        if self._flash_job: self.after_cancel(self._flash_job)
+        self._flash_job = self.after(ms, self._end_flash)
+
+    def _end_flash(self):
+        self._flash_job = None; self.status.config(text=self._status_default)
+
+    def require_source(self, msg="Open a Fiorencia C++ source file first."):
+        if self.path and self.disk: return True
+        messagebox.showinfo("Open source", msg, parent=self); return False
+
+    def _update_title(self):
+        name = self.path.name if self.path else "untitled"
+        self.title(("* " if (self.dirty or self.design_dirty) else "") + name + " — Fiorencia Development Workbench")
+
+    def _bundle_has_data(self):
+        return any(self.bundle.get(k) for k in SECTIONS)
+
+    def update_status(self):
+        src, _err = self.get_preview() if self.path else (None, None)
+        errs = self.get_validation()
+        zone = BEGIN in (src or self.disk)
+        valid = "no source" if errs is None else ("checks OK" if not errs else "%d issue(s)" % len(errs))
+        if self.build_running: build = "building…"
+        elif self.built_binary: build = "build current" if self._build_is_current() else "build STALE"
+        else: build = "no build"
+        name = self.path.name if self.path else "no file"
+        self._status_default = "%s — %d staged edit(s), %d patch(es), %d design(s)" % (name, len(self.vanilla_edits), len(self.dev_patches), len(self.designs))
+        self.status_right.config(text="Mod zone: %s | %s | %s | Saved: %s" % ("yes" if zone else "no", valid, build, self.saved_at))
+        if not self._flash_job: self.status.config(text=self._status_default)
+        self.build_state_text()
+
+    def build_state_text(self):
+        if not hasattr(self, "build_state_label"): return
+        if self.build_running: t = "Building…"
+        elif self.built_binary: t = "Binary is up to date" if self._build_is_current() else "Binary is OLDER than your edits (rebuild)"
+        else: t = self.build_state
+        self.build_state_label.config(text=t)
+
+    def _build_is_current(self):
+        src, err = self.get_preview()
+        return bool(src) and self.build_hash == hashlib.sha1(src.encode("utf-8")).hexdigest()
+
+    def changed(self):
+        self.dirty = True; self._rev += 1
+        self.dirtylabel.config(text="● Unsaved changes", style="Dirty.TLabel")
+        self._update_title(); self._vanilla_refresh_list()
+        self.refresh_raw(); self.update_status(); self.refresh_review()
+
+    def _touch(self):
+        self._rev += 1
+
+    # ------------------------------------------------------------ render pipeline (engine calls unchanged)
+    def render_base(self):
+        if not self.path: raise ValueError("Open a source file first.")
+        clean = strip_dev_patches(self.disk)
+        base = apply_vanilla_edits(clean, self.vanilla_edits) if self.vanilla_edits else clean
+        if self._bundle_has_data(): base = inject_zone(base, self.bundle)
+        return base
+
+    def render(self):
+        base = self.render_base()
+        return apply_dev_patches(base, self.dev_patches) if self.dev_patches else base
+
+    def get_preview(self):
+        if self._preview_cache[0] == self._rev: return self._preview_cache[1], self._preview_cache[2]
+        try: src, err = self.render(), None
+        except Exception as e: src, err = None, str(e)
+        self._preview_cache = (self._rev, src, err)
+        return src, err
+
+    def get_validation(self):
+        if not self.path: return None
+        if self._validation_cache[0] == self._rev: return self._validation_cache[1]
+        src, err = self.get_preview()
+        if err: errs = ["Source preview failed: " + err]
+        else:
+            try: errs = validate_workbench_source(src, self.bundle)
+            except Exception as e: errs = ["Validation could not run (check mod data values): " + str(e)]
+        self._validation_cache = (self._rev, errs); return errs
+
+    # ------------------------------------------------------------ file handling
+    def _default_source(self):
+        """Choose a sensible first source while preserving the user's last-opened file."""
+        last = self.settings.get("last_file")
+        if last and Path(last).exists():
+            return last
+
+        # Prefer the human-readable extensible edition when the workbench sits
+        # beside it. Keep older project layouts supported as fallbacks.
+        names = (
+            "fiorencia_extensible_readable.cpp",
+            "fiorencia_extensible.cpp",
+            "fiorencia.cpp",
+        )
+        roots = (Path(__file__).resolve().parent, Path.cwd())
+        seen = set()
+        for root in roots:
+            for name in names:
+                candidate = root / name
+                key = str(candidate.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                if candidate.is_file():
+                    return str(candidate)
+        return None
+
+    def _read_source(self, path):
+        p = Path(path).resolve()
+        text, eol, raw = read_source_text(p)
+        mt = p.stat().st_mtime_ns
+        self.path, self.disk, self.eol, self.disk_bytes, self.disk_mtime = p, text, eol, raw, mt
+        self._ext_warned = False
+
+    def load_file(self, path):
+        try: self._read_source(path)
+        except Exception as e:
+            messagebox.showerror("Open failed", str(e), parent=self); return False
+        self.vanilla_edits = {}; self.current_vanilla_label = None; self.session_backup_done = False
+        self.dev_patches = parse_dev_patches(self.disk); self.dirty = False; self._touch()
+        self.filelabel.config(text=str(self.path)); self._update_title()
+        self.dirtylabel.config(text="● Saved", style="Clean.TLabel")
+        self.refresh_feature_tree(); self.load_tuning_from_source(); self._vanilla_refresh_list()
+        self.load_vanilla_block(VANILLA_BLOCKS[0][0], quiet=True)
+        self.designs = []; self.design_dirty = False; self.current_design_index = None
+        sidecar = self.path.with_suffix(".designs.json")
+        if sidecar.exists():
+            try:
+                loaded = json.loads(sidecar.read_text(encoding="utf-8"))
+                if loaded.get("format") == "fiorencia-item-designs-v1" and isinstance(loaded.get("designs"), list): self.designs = loaded["designs"]
+            except Exception as e: messagebox.showwarning("Design sidecar not loaded", str(e), parent=self)
+        self.refresh_design_tree(); self.new_item_design()
+        bsc = self.path.with_suffix(".bundle.json")
+        if bsc.exists() and not self._bundle_has_data():
+            if messagebox.askyesno("Mod bundle found", "%s was saved next to the source.\nLoad it into Mod Content?" % bsc.name, parent=self):
+                try:
+                    self.bundle = self._read_bundle(bsc); self.bundle_file = bsc; self.zone_ack = True
+                    self._touch(); src, err = self.get_preview()
+                    if src is not None and src != self.disk: self.changed()
+                except Exception as e: messagebox.showerror("Bundle error", str(e), parent=self)
+        self.refresh_all(); self._remember_file()
+        self.update_status(); self.refresh_raw(); self.refresh_review()
+        self.flash("Opened %s (%s line endings)" % (self.path.name, "CRLF" if self.eol == "\r\n" else "LF"))
+        return True
+
+    def _remember_file(self):
+        self.settings["last_file"] = str(self.path)
+        rec = [p for p in self.settings.get("recent", []) if p != str(self.path)]
+        self.settings["recent"] = ([str(self.path)] + rec)[:8]
+        save_settings(self.settings); self._rebuild_recent()
+
+    def _save_settings(self):
+        try: self.settings["geometry"] = self.geometry()
+        except Exception: pass
+        self.settings["diff"] = bool(self.diffvar.get())
+        if hasattr(self, "run_args"): self.settings["run_args"] = self.run_args.get()
+        save_settings(self.settings)
+
+    def _open_path(self, p):
+        if self.confirm_discard("opening another file"): self.load_file(p)
+
+    def open_file(self):
+        if not self.confirm_discard("opening another file"): return
+        init = str(self.path.parent) if self.path else self.settings.get("last_dir", str(Path.cwd()))
+        p = filedialog.askopenfilename(title="Open Fiorencia source", initialdir=init, filetypes=[("C++ source", "*.cpp"), ("All files", "*.*")])
+        if p: self.settings["last_dir"] = str(Path(p).parent); self.load_file(p)
+
+    def reload(self):
+        if self.path and self.confirm_discard("reloading"): self.load_file(self.path)
+
+    def revert(self):
+        if not self.path: return
+        bak = Path(str(self.path) + ".bak")
+        if not bak.exists(): messagebox.showinfo("Revert", "No .bak file exists.", parent=self); return
+        if not messagebox.askyesno("Revert", "Replace the current source with the latest .bak?\n(The file as it is now is not backed up again.)", parent=self): return
+        shutil.copy2(bak, self.path); self.load_file(self.path)
+
+    def confirm_discard(self, action):
+        if not (self.dirty or self.design_dirty or self._vanilla_unapplied()): return True
+        ans = messagebox.askyesnocancel("Unsaved changes", "You have unsaved changes. Save them before %s?" % action, parent=self)
+        if ans is None: return False
+        if not ans: return True
+        if not self.path:
+            self.export_item_designs(); return not self.design_dirty
+        return bool(self.save())
+
+    def quit_app(self):
+        if not self.confirm_discard("quitting"): return
+        if self.proc and self.proc.poll() is None: self.proc.terminate()
+        self._save_settings(); self.destroy()
+
+    def _on_focus(self, e):
+        if e.widget is not self or not self.path: return
+        now = time.time()
+        if now - self._last_focus_check < 1.0: return
+        self._last_focus_check = now
+        try: mt = self.path.stat().st_mtime_ns
+        except OSError: return
+        if mt == self.disk_mtime: return
+        if self.dirty or self._vanilla_unapplied():
+            if not self._ext_warned:
+                self._ext_warned = True; self.flash("⚠ %s changed on disk. Saving will ask before overwriting it." % self.path.name, 15000)
+            return
+        try: self._read_source(self.path)
+        except Exception as ex: self.flash("Could not re-read source: %s" % ex); return
+        self.vanilla_edits = {}; self.dev_patches = parse_dev_patches(self.disk); self._touch()
+        self.refresh_feature_tree(); self.load_tuning_from_source(); self._vanilla_refresh_list()
+        if self.current_vanilla_label: self.load_vanilla_block(self.current_vanilla_label, quiet=True)
+        self.update_status(); self.refresh_raw(); self.refresh_review()
+        self.flash("%s changed on disk — reloaded." % self.path.name, 9000)
+
+    # ------------------------------------------------------------ saving
+    def save(self):
+        if not self.path: return self.save_as()
+        if not self._vanilla_resolve_pending(): return False
+        parts = []
+        if self.dirty:
+            if not self._do_save(self.path): return False
+            parts.append("source saved (backup: %s.bak)" % self.path.name)
+        else: parts.append("no source changes")
+        if self.design_dirty and self._write_designs(self.path.with_suffix(".designs.json"), quiet=True): parts.append("designs saved")
+        self.update_status(); self.flash("; ".join(parts).capitalize() + ". Press F5 to build.", 9000)
+        return True
+
+    def save_as(self):
+        if not self.disk: messagebox.showinfo("Save As", "Open a source file first.", parent=self); return False
+        p = filedialog.asksaveasfilename(title="Save source as", defaultextension=".cpp", initialdir=str(self.path.parent) if self.path else None, filetypes=[("C++ source", "*.cpp")])
+        if not p: return False
+        if not self._vanilla_resolve_pending(): return False
+        if self._do_save(Path(p).resolve(), as_new=True): self.update_status(); self.flash("Saved as %s" % Path(p).name); return True
+        return False
+
+    def _do_save(self, target, as_new=False):
+        src, err = self.get_preview()
+        if err: messagebox.showerror("Save blocked", "Preview failed:\n" + err, parent=self); return False
+        errors = validate_workbench_source(src, self.bundle)
+        if errors:
+            self.select_tab("review"); self.refresh_review(force=True)
+            messagebox.showerror("Validation failed", "Save blocked:\n\n" + "\n".join(errors[:12]) + ("\n…" if len(errors) > 12 else "") + "\n\nThe Review tab lists a hint for each issue.", parent=self); return False
+        if BEGIN in self.disk and self._bundle_has_data() and not self.zone_ack:
+            if not messagebox.askyesno("Replace existing MOD ZONE?", "This source already contains a MOD ZONE. Saving regenerates it from the Mod Content tabs only; anything not in your bundle is removed.\n\nTip: Load the matching bundle first (File > Load Mod Bundle). Continue?", icon="warning", parent=self): return False
+            self.zone_ack = True
+        if not as_new and target.exists() and target.stat().st_mtime_ns != self.disk_mtime:
+            if not messagebox.askyesno("File changed on disk", "%s was modified outside the workbench after it was opened.\nOverwrite those changes with your staged edits? (A .bak of the current file is made first.)" % target.name, icon="warning", parent=self): return False
+        try:
+            if target.exists():
+                current = target.read_bytes()
+                Path(str(target) + ".bak").write_bytes(current)
+                if not self.session_backup_done:
+                    Path("%s.%s.bak" % (target, datetime.now().strftime("%Y%m%d-%H%M%S"))).write_bytes(current); self.session_backup_done = True
+            data = to_disk_text(src, self.eol).encode("utf-8")
+            tmp = target.with_name(target.name + ".tmp"); tmp.write_bytes(data); os.replace(str(tmp), str(target))
+            if self._bundle_has_data():
+                bp = target.with_suffix(".bundle.json"); self._write_bundle(bp); self.bundle_file = bp
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e), parent=self); return False
+        self.path = target; self.disk = src; self.disk_bytes = data; self.disk_mtime = target.stat().st_mtime_ns; self._ext_warned = False
+        self.vanilla_edits = {}; self.dev_patches = parse_dev_patches(src); self.dirty = False
+        self.saved_at = datetime.now().strftime("%H:%M:%S"); self._touch()
+        self.filelabel.config(text=str(self.path)); self.dirtylabel.config(text="● Saved", style="Clean.TLabel")
+        self.refresh_feature_tree(); self.load_tuning_from_source(); self._vanilla_refresh_list()
+        if self.current_vanilla_label: self.load_vanilla_block(self.current_vanilla_label, quiet=True)
+        self._update_title(); self.refresh_raw(); self.refresh_review(); self.refresh_all(); self._remember_file()
+        return True
+
+    # ------------------------------------------------------------ 1. Existing content
+    def _vanilla_tab(self, frame):
+        ttk.Label(frame, text="Edit existing C++ blocks in place. Pick a block on the left, edit, then Apply (Ctrl+Enter). Edits are staged and only written when you Save; red ● marks staged blocks. Raw C++ edits can break compilation or save compatibility, so check Preview / Diff.", wraplength=1100, style="Muted.TLabel").pack(anchor="w", padx=10, pady=(10, 4))
+        pw = ttk.Panedwindow(frame, orient="horizontal"); pw.pack(fill="both", expand=True, padx=8, pady=4)
+        left = ttk.Frame(pw); right = ttk.Frame(pw); pw.add(left, weight=1); pw.add(right, weight=4)
+        self.vanilla_filter = tk.StringVar()
+        frow = ttk.Frame(left); frow.pack(fill="x", pady=(0, 3)); ttk.Label(frow, text="Filter:").pack(side="left")
+        ttk.Entry(frow, textvariable=self.vanilla_filter).pack(side="left", fill="x", expand=True, padx=4)
+        lbf = ttk.Frame(left); lbf.pack(fill="both", expand=True)
+        self.vanilla_list = tk.Listbox(lbf, exportselection=False, activestyle="none", width=34)
+        ls = ttk.Scrollbar(lbf, orient="vertical", command=self.vanilla_list.yview); self.vanilla_list.configure(yscrollcommand=ls.set)
+        self.vanilla_list.pack(side="left", fill="both", expand=True); ls.pack(side="right", fill="y")
+        self.vanilla_list.bind("<<ListboxSelect>>", self._vanilla_select)
+        self.vanilla_filter.trace_add("write", lambda *_: self._vanilla_refresh_list())
+        bar = ttk.Frame(right); bar.pack(fill="x")
+        for text, cmd, tip in (("Apply (Ctrl+Enter)", self.apply_vanilla_block, "Stage this block's edit"), ("Revert editor", self.revert_vanilla_editor, "Discard unapplied typing"),
+                               ("Restore original", self.restore_vanilla_block, "Drop the staged edit for this block"), ("Show block diff", self.show_vanilla_diff, "Original vs. editor text")):
+            b = ttk.Button(bar, text=text, command=cmd); b.pack(side="left", padx=(0, 4)); Tip(b, tip)
+        self.vanilla_info = ttk.Label(right, text="Open a source file to browse its blocks.", style="Muted.TLabel"); self.vanilla_info.pack(anchor="w", pady=4)
+        fr, self.vanilla_text = scrolled_text(right, font=("TkFixedFont", 10), undo=True); fr.pack(fill="both", expand=True)
+        self.vanilla_text.tag_configure("cmt", foreground="#6a8759"); self.vanilla_text.tag_configure("str", foreground="#b5651d")
+        self.vanilla_text.bind("<KeyRelease>", self._vanilla_key); self.vanilla_text.bind("<<Paste>>", lambda e: self.after(50, self._vanilla_key))
+        self.vanilla_text.bind("<Control-Return>", lambda e: (self.apply_vanilla_block(), "break")[1])
+        self._vanilla_refresh_list()
+
+    def _vanilla_spec(self, label):
+        return next((x for x in VANILLA_BLOCKS if x[0] == label), None)
+
+    def _vanilla_refresh_list(self):
+        if not hasattr(self, "vanilla_list"): return
+        flt = self.vanilla_filter.get().strip().lower()
+        self.vanilla_visible = [b[0] for b in VANILLA_BLOCKS if flt in b[0].lower()]
+        lb = self.vanilla_list; lb.delete(0, "end")
+        for i, lab in enumerate(self.vanilla_visible):
+            staged = lab in self.vanilla_edits
+            lb.insert("end", ("● " if staged else "   ") + lab)
+            if staged: lb.itemconfig(i, foreground="#b00020")
+        if self.current_vanilla_label in self.vanilla_visible:
+            i = self.vanilla_visible.index(self.current_vanilla_label); lb.selection_set(i); lb.see(i)
+
+    def _vanilla_select(self, _e=None):
+        sel = self.vanilla_list.curselection()
+        if not sel: return
+        label = self.vanilla_visible[sel[0]]
+        if label == self.current_vanilla_label: return
+        if not self._vanilla_resolve_pending():
+            self._vanilla_refresh_list(); return
+        self.load_vanilla_block(label)
+
+    def _vanilla_unapplied(self):
+        if not self.current_vanilla_label or not hasattr(self, "vanilla_text"): return False
+        return self.vanilla_text.get("1.0", "end-1c").rstrip("\r\n") != self.vanilla_loaded_text.rstrip("\r\n")
+
+    def _vanilla_resolve_pending(self):
+        """True when it is safe to continue (nothing pending, applied, or discarded on request)."""
+        if not self._vanilla_unapplied(): return True
+        ans = messagebox.askyesnocancel("Unapplied edit", "'%s' has typing that was not applied.\n\nYes = apply it, No = discard it, Cancel = stay." % self.current_vanilla_label, parent=self)
+        if ans is None: return False
+        if ans: return self.apply_vanilla_block(quiet=True)
+        self.revert_vanilla_editor(); return True
+
+    def load_vanilla_block(self, label=None, quiet=False):
+        if not self.path or not self.disk:
+            if not quiet: messagebox.showinfo("Open source", "Open a Fiorencia C++ source file first.", parent=self)
+            return
+        label = label or self.current_vanilla_label or VANILLA_BLOCKS[0][0]
+        spec = self._vanilla_spec(label)
+        if not spec: return
+        try: _s, _e, original = locate_vanilla_block(strip_dev_patches(self.disk), spec[1], spec[2])
+        except Exception as e:
+            self.vanilla_info.config(text="%s — anchor not found in this source: %s" % (label, e), style="Dirty.TLabel")
+            if not quiet: messagebox.showerror("Cannot load block", str(e), parent=self)
+            return
+        current = self.vanilla_edits.get(label, original)
+        self.current_vanilla_label, self.vanilla_original, self.vanilla_loaded_text = label, original, current
+        self.vanilla_text.delete("1.0", "end"); self.vanilla_text.insert("1.0", current); self.vanilla_text.edit_reset()
+        self._vanilla_highlight(); self._vanilla_update_info(); self._vanilla_refresh_list()
+
+    def _vanilla_clear_editor(self):
+        self.current_vanilla_label = None; self.vanilla_text.delete("1.0", "end"); self._vanilla_update_info()
+
+    def _vanilla_update_info(self):
+        lab = self.current_vanilla_label
+        if not lab: self.vanilla_info.config(text="Select a block on the left.", style="Muted.TLabel"); return
+        spec = self._vanilla_spec(lab); un = self._vanilla_unapplied()
+        state = "UNAPPLIED typing: press Ctrl+Enter to stage it" if un else ("staged edit (written on Save)" if lab in self.vanilla_edits else "original source")
+        self.vanilla_info.config(text="%s  [%s]  —  %s" % (lab, spec[2], state), style="Dirty.TLabel" if un else "Muted.TLabel")
+
+    def _vanilla_key(self, _e=None):
+        if self._hl_job: self.after_cancel(self._hl_job)
+        self._hl_job = self.after(250, lambda: (self._vanilla_highlight(), self._vanilla_update_info()))
+
+    def _vanilla_highlight(self):
+        self._hl_job = None; t = self.vanilla_text
+        for tag in ("cmt", "str"): t.tag_remove(tag, "1.0", "end")
+        text = t.get("1.0", "end-1c")
+        for m in re.finditer(r'(//[^\n]*|/\*.*?\*/)|("(?:\\.|[^"\\\n])*")', text, re.DOTALL):
+            t.tag_add("cmt" if m.group(1) else "str", "1.0+%dc" % m.start(), "1.0+%dc" % m.end())
+
+    def apply_vanilla_block(self, quiet=False):
+        label = self.current_vanilla_label; spec = self._vanilla_spec(label) if label else None
+        if not self.path or not spec:
+            if not quiet: messagebox.showinfo("Open source", "Open a Fiorencia C++ source file and select a block first.", parent=self)
+            return False
+        new_text = self.vanilla_text.get("1.0", "end-1c")
+        if not new_text.strip(): messagebox.showerror("Empty block", "A source block cannot be empty.", parent=self); return False
+        try:
+            base = strip_dev_patches(self.disk)
+            _a, _b, original = locate_vanilla_block(base, spec[1], spec[2])
+            if spec[2] in ("initializer", "function"):
+                opening = new_text.find("{")
+                if opening < 0: raise ValueError("Expected a C++ initializer/function body containing '{'.")
+                end = matching_brace_end(new_text, opening)
+                if spec[2] == "initializer" and ";" not in new_text[end:]: raise ValueError("Array declaration must retain its trailing semicolon.")
+            elif "=" not in new_text or ";" not in new_text: raise ValueError("Constant declaration must retain '=' and ';'.")
+            replacement = new_text.rstrip("\r\n")
+            if spec[2] in ("line", "function"): replacement += "\n"
+            candidate = dict(self.vanilla_edits)
+            if replacement.rstrip("\r\n") == original.rstrip("\r\n"): candidate.pop(label, None)
+            else: candidate[label] = replacement
+            result = apply_vanilla_edits(base, candidate)
+            errs = lexical_cpp_check(result)
+            if errs: raise ValueError("This edit leaves the source structurally invalid: " + "; ".join(errs))
+        except Exception as e:
+            messagebox.showerror("Invalid source block", str(e), parent=self); return False
+        was = dict(self.vanilla_edits); self.vanilla_edits = candidate; self.vanilla_loaded_text = new_text
+        self._vanilla_update_info(); self._vanilla_refresh_list()
+        if candidate != was: self.changed()
+        self.flash(("Staged edit for “%s”. Save writes a .bak first." % label) if label in candidate else ("“%s” matches the original again; edit cleared." % label))
+        return True
+
+    def revert_vanilla_editor(self):
+        if self.current_vanilla_label: self.load_vanilla_block(self.current_vanilla_label, quiet=True)
+
+    def restore_vanilla_block(self):
+        label = self.current_vanilla_label
+        if label and label in self.vanilla_edits:
+            del self.vanilla_edits[label]; self.load_vanilla_block(label, quiet=True); self.changed(); self.flash("Restored original “%s”." % label)
+
+    def show_vanilla_diff(self):
+        if not self.current_vanilla_label: return
+        cur = self.vanilla_text.get("1.0", "end-1c")
+        d = "".join(difflib.unified_diff(self.vanilla_original.splitlines(True), cur.splitlines(True), fromfile="original", tofile="editor"))
+        if not d: self.flash("No differences from the original block."); return
+        self.show_text_window("Block diff — " + self.current_vanilla_label, d, diff=True)
+
+    def show_text_window(self, title, text, diff=False):
+        win = tk.Toplevel(self); win.title(title); win.geometry("880x560"); win.transient(self)
+        fr, t = scrolled_text(win, font=("TkFixedFont", 9)); fr.pack(fill="both", expand=True, padx=6, pady=6)
+        config_diff_tags(t); t.insert("1.0", text)
+        if diff: colorize_diff(t, text)
+        t.configure(state="disabled")
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 6)); win.bind("<Escape>", lambda e: win.destroy())
+
+    # ------------------------------------------------------------ 2. Tuning
+    def _tuning_tab(self, frame):
+        ttk.Label(frame, text="Balance dials from the game's economy block. Values that differ from the source are marked ●. Apply stages the changes (nothing is written until Save); only values that really changed are staged.", wraplength=1100, style="Muted.TLabel").pack(anchor="w", padx=12, pady=(10, 4))
+        self.tuning_vars, self.tuning_base, self.tuning_marks = {}, {}, {}
+        grid = ttk.Frame(frame); grid.pack(anchor="nw", padx=12, pady=6, fill="x")
+        for gi, (title, items) in enumerate(TUNING_GROUPS):
+            box = ttk.LabelFrame(grid, text=title); box.grid(row=gi // 2, column=gi % 2, sticky="nsew", padx=6, pady=6)
+            for r, (key, help_) in enumerate(items):
+                ttk.Label(box, text=key, width=16).grid(row=r, column=0, sticky="w", padx=4, pady=2)
+                sv = tk.StringVar(value=str(TUNING_DEFAULTS[key])); self.tuning_vars[key] = sv
+                ttk.Spinbox(box, from_=-999999, to=999999, textvariable=sv, width=9).grid(row=r, column=1, padx=4, pady=2)
+                mark = ttk.Label(box, text="", width=2, style="Dirty.TLabel"); mark.grid(row=r, column=2); self.tuning_marks[key] = mark
+                ttk.Label(box, text=help_, style="Muted.TLabel").grid(row=r, column=3, sticky="w", padx=4)
+                sv.trace_add("write", lambda *_a, k=key: self._tuning_mark(k))
+        grid.columnconfigure(0, weight=1); grid.columnconfigure(1, weight=1)
+        bar = ttk.Frame(frame); bar.pack(anchor="w", padx=12, pady=4)
+        ttk.Button(bar, text="Apply tuning to source", command=self.apply_tuning_values).pack(side="left")
+        ttk.Button(bar, text="Reload values from source", command=self.load_tuning_from_source).pack(side="left", padx=6)
+        self.tuning_summary = ttk.Label(bar, text="", style="Muted.TLabel"); self.tuning_summary.pack(side="left", padx=10)
+
+    def _tuning_mark(self, key):
+        base = self.tuning_base.get(key)
+        diff = base is not None and self.tuning_vars[key].get().strip() != base
+        self.tuning_marks[key].config(text="●" if diff else "")
+        n = sum(1 for k in self.tuning_vars if self.tuning_base.get(k) is not None and self.tuning_vars[k].get().strip() != self.tuning_base[k])
+        self.tuning_summary.config(text="%d value(s) differ from source" % n if n else "")
+
+    def load_tuning_from_source(self):
+        if not hasattr(self, "tuning_vars") or not self.disk: return
+        src = strip_dev_patches(self.disk)
+        for key in TUNING_SCALAR:
+            m = re.search(r"\b" + re.escape(key) + r"\s*=\s*(-?\d+)", src)
+            if m and key in self.tuning_vars: self.tuning_vars[key].set(m.group(1))
+        for key, label in TUNING_ARRAYS.items():
+            spec = self._vanilla_spec(label)
+            if not spec: continue
+            try:
+                _a, _b, block = locate_vanilla_block(src, spec[1], spec[2])
+                m = re.search(r"\{([^{}]*)\}", block, re.DOTALL)
+                if not m: continue
+                for i, value in enumerate(re.findall(r"-?\d+", m.group(1))):
+                    k = "%s[%d]" % (key, i)
+                    if k in self.tuning_vars: self.tuning_vars[k].set(value)
+            except ValueError: pass
+        self.tuning_base = {k: v.get().strip() for k, v in self.tuning_vars.items()}
+        for k in self.tuning_vars: self._tuning_mark(k)
+
+    def apply_tuning_values(self):
+        if not self.require_source("Open a C++ source file first."): return
+        if not self._vanilla_resolve_pending(): return
+        staged = dict(self.vanilla_edits)
+        try:
+            source = strip_dev_patches(self.disk)
+            def stage(label, new_text, original):
+                if new_text.rstrip("\r\n") == original.rstrip("\r\n"): staged.pop(label, None)
+                else: staged[label] = new_text
+            for key, label in TUNING_SCALAR.items():
+                value = int(self.tuning_vars[key].get())
+                spec = self._vanilla_spec(label); _a, _b, original = locate_vanilla_block(source, spec[1], spec[2])
+                current = staged.get(label, original)
+                changed, count = re.subn(r"(\b" + re.escape(key) + r"\s*=\s*)-?\d+", lambda m: m.group(1) + str(value), current, count=1)
+                if count != 1: raise ValueError("Could not locate numeric value for %s in %s." % (key, label))
+                stage(label, changed, original)
+            for key, label in TUNING_ARRAYS.items():
+                spec = self._vanilla_spec(label); _a, _b, original = locate_vanilla_block(source, spec[1], spec[2])
+                current = staged.get(label, original)
+                values = [int(self.tuning_vars["%s[%d]" % (key, i)].get()) for i in range(sum(1 for n in self.tuning_vars if n.startswith(key + "[")))]
+                m = re.search(r"(\{)([^{}]*)(\})", current, re.DOTALL)
+                if not m: raise ValueError("Could not locate initializer for %s." % key)
+                stage(label, current[:m.start()] + m.group(1) + ", ".join(str(v) for v in values) + m.group(3) + current[m.end():], original)
+            candidate = apply_vanilla_edits(source, staged)
+            errs = lexical_cpp_check(candidate)
+            if errs: raise ValueError("Staged tuning failed structural validation: " + "; ".join(errs))
+        except ValueError as e:
+            messagebox.showerror("Tuning not applied", "Every field must be a whole number.\n\n%s" % e, parent=self); return
+        except Exception as e:
+            messagebox.showerror("Tuning not applied", str(e), parent=self); return
+        if staged == self.vanilla_edits: self.flash("No tuning changes to stage."); return
+        self.vanilla_edits = staged
+        if self.current_vanilla_label: self.load_vanilla_block(self.current_vanilla_label, quiet=True)
+        self.changed(); self.flash("Tuning staged. Review the diff (toolbar > Diff), then Save.")
+
+    # ------------------------------------------------------------ 3. Mod content (tables)
+    def _mods_tab(self, frame):
+        ttk.Label(frame, text="Mod content is generated into the MOD ZONE of the open C++ source as plain data tables. It affects gameplay only after a runtime hook (5 Gameplay Patches) reads it. Table # numbers are the row indices other tables refer to.", wraplength=1100, style="Muted.TLabel").pack(anchor="w", padx=10, pady=(8, 2))
+        bb = ttk.Frame(frame); bb.pack(fill="x", padx=10, pady=2)
+        for text, cmd in (("Load bundle…", self.load_bundle), ("Save bundle…", self.save_bundle), ("Insert sample", self.insert_sample_bundle), ("Undo", self.undo_bundle)):
+            ttk.Button(bb, text=text, command=cmd).pack(side="left", padx=(0, 4))
+        self.bundle_label = ttk.Label(bb, text="", style="Muted.TLabel"); self.bundle_label.pack(side="left", padx=10)
+        self.mod_nb = ttk.Notebook(frame); self.mod_nb.pack(fill="both", expand=True, padx=8, pady=6)
+        for key, label in (("items", "Items"), ("enemies", "Enemies"), ("quests", "Quests"), ("dialogs", "Dialogue"), ("story", "Scenes & rumors"), ("flavor", "Flavor")):
+            f = ttk.Frame(self.mod_nb); self.mod_nb.add(f, text=label); self.mod_tabs[key] = (f, label)
+            if key == "items":
+                ttk.Label(f, text="To change existing potions, spells or shop stock use 1 Existing Content. Items here are data until a runtime hook uses them.", style="Muted.TLabel").pack(anchor="w", padx=8, pady=(6, 0))
+            if key == "story":
+                pw = ttk.Panedwindow(f, orient="vertical"); pw.pack(fill="both", expand=True)
+                for sk, cap in (("scenes", "Interludes (scenes)"), ("rumors", "Rumors")):
+                    pane = ttk.Frame(pw); pw.add(pane, weight=1); ttk.Label(pane, text=cap, style="Head.TLabel").pack(anchor="w", padx=8, pady=(6, 0)); self._table_tab(pane, sk)
+            else: self._table_tab(f, key)
+        self._update_bundle_label()
+
+    def _table_tab(self, frame, key):
+        bar = ttk.Frame(frame); bar.pack(fill="x", padx=6, pady=(6, 2))
+        for text, cmd, w in (("Add", lambda: self.add_row(key), 8), ("Edit", lambda: self.edit_row(key), 8), ("Duplicate", lambda: self.duplicate_row(key), 10),
+                             ("Delete", lambda: self.delete_row(key), 8), ("▲", lambda: self.move_row(key, -1), 3), ("▼", lambda: self.move_row(key, 1), 3)):
+            ttk.Button(bar, text=text, command=cmd, width=w).pack(side="left", padx=(0, 3))
+        fv = tk.StringVar(); ttk.Entry(bar, textvariable=fv, width=22).pack(side="right"); ttk.Label(bar, text="Filter:").pack(side="right", padx=(8, 3))
+        top = ttk.Frame(frame); top.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        tree = ttk.Treeview(top, show="headings", selectmode="browse")
+        vs = ttk.Scrollbar(top, orient="vertical", command=tree.yview); hs = ttk.Scrollbar(top, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        tree.grid(row=0, column=0, sticky="nsew"); vs.grid(row=0, column=1, sticky="ns"); hs.grid(row=1, column=0, sticky="ew")
+        top.rowconfigure(0, weight=1); top.columnconfigure(0, weight=1)
+        self.tables[key] = {"tree": tree, "cols": None, "filter": fv}
+        fv.trace_add("write", lambda *_: self.refresh_table(key))
+        def dbl(e):
+            if tree.identify_region(e.x, e.y) == "cell": self.edit_row(key)
+        tree.bind("<Double-1>", dbl); tree.bind("<Return>", lambda e: self.edit_row(key)); tree.bind("<Delete>", lambda e: self.delete_row(key))
+        tree.bind("<Control-z>", lambda e: (self.undo_bundle(), "break")[1]); tree.bind("<Control-d>", lambda e: (self.duplicate_row(key), "break")[1])
+        self.refresh_table(key)
+
+    def _table_columns(self, key):
+        if key == "flavor": return ("text",)
+        cols = list(ROW_DEFAULTS.get(key, {}))
+        for r in self.bundle.get(key, []):
+            if isinstance(r, dict):
+                for k in r:
+                    if k not in cols: cols.append(k)
+        return tuple(cols)
+
+    def _selected_index(self, key):
+        sel = self.tables[key]["tree"].selection()
+        return int(sel[0]) if sel else None
+
+    def _select_row(self, key, i):
+        tree = self.tables[key]["tree"]
+        if tree.exists(str(i)): tree.selection_set(str(i)); tree.see(str(i)); tree.focus(str(i))
+
+    def refresh_table(self, key):
+        info = self.tables.get(key)
+        if not info: return
+        tree = info["tree"]; rows = self.bundle.get(key, []); cols = self._table_columns(key)
+        if cols != info["cols"]:
+            tree.configure(columns=("idx",) + cols)
+            tree.heading("idx", text="#"); tree.column("idx", width=42, minwidth=30, stretch=False, anchor="e")
+            for c in cols:
+                tree.heading(c, text=c); tree.column(c, width=300 if c in TEXT_FIELDS else 110, minwidth=40, stretch=True, anchor="w")
+            info["cols"] = cols
+        flt = info["filter"].get().strip().lower()
+        prev = self._selected_index(key)
+        tree.delete(*tree.get_children())
+        for i, item in enumerate(rows):
+            vals = [str(i)]
+            for c in cols:
+                v = item.get(c, "") if isinstance(item, dict) else (item if c == "text" else "")
+                if isinstance(v, (dict, list)): v = json.dumps(v, ensure_ascii=False)
+                vals.append(str(v)[:160])
+            if flt and flt not in " ".join(vals).lower(): continue
+            tree.insert("", "end", iid=str(i), values=vals)
+        if prev is not None and tree.exists(str(prev)): tree.selection_set(str(prev))
+
+    def refresh_all(self):
+        for k in self.tables: self.refresh_table(k)
+        for key, (f, label) in self.mod_tabs.items():
+            n = sum(len(self.bundle.get(k, [])) for k in (("scenes", "rumors") if key == "story" else (key,)))
+            self.mod_nb.tab(f, text="%s (%d)" % (label, n) if n else label)
+        self._update_bundle_label()
+
+    def _update_bundle_label(self):
+        if hasattr(self, "bundle_label"):
+            n = sum(len(self.bundle.get(k, [])) for k in SECTIONS)
+            self.bundle_label.config(text="Bundle: %s — %d row(s)" % (self.bundle_file.name if self.bundle_file else "not saved to a file", n))
+
+    def push_undo(self):
+        self.bundle_history.append(copy.deepcopy(self.bundle)); del self.bundle_history[:-30]
+
+    def undo_bundle(self):
+        if not self.bundle_history: self.flash("Nothing to undo in mod data."); return
+        self.bundle = self.bundle_history.pop(); self.changed(); self.refresh_all(); self.flash("Undid last mod-data change.")
+
+    def _bundle_changed(self, key=None, select=None):
+        self.changed(); self.refresh_all()
+        if key and select is not None: self._select_row(key, select)
+
+    def add_row(self, key):
+        rows = self.bundle.setdefault(key, [])
+        if key == "flavor":
+            val = simpledialog.askstring("Add flavor", "Flavor line:", parent=self)
+            if val is None: return
+            self.push_undo(); rows.append(val); self._bundle_changed(key, len(rows) - 1); return
+        def done(rec):
+            self.push_undo(); self.bundle.setdefault(key, []).append(rec); self._bundle_changed(key, len(self.bundle[key]) - 1)
+        RecordDialog(self, "Add " + SINGULAR[key], copy.deepcopy(ROW_DEFAULTS.get(key, {})), ROW_DEFAULTS.get(key, {}), done, RECORD_HINTS.get(key, ""))
+
+    def edit_row(self, key):
+        idx = self._selected_index(key)
+        if idx is None: self.flash("Select a row first."); return
+        old = self.bundle[key][idx]
+        if isinstance(old, str):
+            val = simpledialog.askstring("Edit flavor", "Flavor line:", initialvalue=old, parent=self)
+            if val is not None: self.push_undo(); self.bundle[key][idx] = val; self._bundle_changed(key, idx)
+            return
+        def done(rec):
+            self.push_undo(); self.bundle[key][idx] = rec; self._bundle_changed(key, idx)
+        RecordDialog(self, "Edit %s #%d" % (SINGULAR[key], idx), copy.deepcopy(old), ROW_DEFAULTS.get(key, {}), done, RECORD_HINTS.get(key, ""))
+
+    def duplicate_row(self, key):
+        idx = self._selected_index(key)
+        if idx is None: self.flash("Select a row first."); return
+        item = copy.deepcopy(self.bundle[key][idx])
+        if isinstance(item, dict):
+            for k in ("key", "id"):
+                if k in item: item[k] = str(item[k]) + "_copy"
+            for k in ("name", "title"):
+                if k in item: item[k] = str(item[k]) + " (copy)"; break
+        self.push_undo(); self.bundle[key].append(item); self._bundle_changed(key, len(self.bundle[key]) - 1)
+
+    def delete_row(self, key):
+        idx = self._selected_index(key)
+        if idx is None: self.flash("Select a row first."); return
+        refs = count_refs(self.bundle, key, idx) if key in ("enemies", "dialogs") else 0
+        msg = "Delete the selected %s (#%d)?" % (SINGULAR[key], idx)
+        if refs: msg += "\n\n%d reference(s) to it in other tables will be cleared to -1, and later rows are renumbered." % refs
+        elif key in ("enemies", "dialogs"): msg += "\n\nLater rows are renumbered and references to them are updated."
+        if not messagebox.askyesno("Delete content", msg + "\n(Undo is available.)", parent=self): return
+        n = len(self.bundle[key]); self.push_undo(); del self.bundle[key][idx]
+        if key in ("enemies", "dialogs"): remap_bundle_refs(self.bundle, key, delete_mapping(n, idx))
+        self._bundle_changed(key)
+
+    def move_row(self, key, delta):
+        idx = self._selected_index(key); rows = self.bundle.get(key, [])
+        if idx is None: self.flash("Select a row first."); return
+        j = idx + delta
+        if not 0 <= j < len(rows): return
+        self.push_undo(); rows[idx], rows[j] = rows[j], rows[idx]
+        if key in ("enemies", "dialogs"): remap_bundle_refs(self.bundle, key, swap_mapping(idx, j))
+        self._bundle_changed(key, j)
+
+    # ------------------------------------------------------------ bundle files
+    def _read_bundle(self, p):
+        b = json.loads(Path(p).read_text(encoding="utf-8"))
+        if not isinstance(b, dict): raise ValueError("A mod bundle must be a JSON object.")
+        for k in SECTIONS:
+            b.setdefault(k, [])
+            if not isinstance(b[k], list): raise ValueError("%s must be a list" % k)
+        return b
+
+    def _write_bundle(self, p):
+        payload = {"format": BUNDLE_FORMAT}; payload.update({k: v for k, v in self.bundle.items() if k != "format"})
+        Path(p).write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def load_bundle(self, path=None):
+        p = path or filedialog.askopenfilename(title="Load mod bundle", initialdir=str(self.path.parent) if self.path else None, filetypes=[("JSON bundle", "*.json"), ("All files", "*.*")])
+        if not p: return
+        try: b = self._read_bundle(p)
+        except Exception as e: messagebox.showerror("Bundle error", str(e), parent=self); return
+        self.push_undo(); self.bundle = b; self.bundle_file = Path(p); self.zone_ack = True
+        self.changed(); self.refresh_all(); self.select_tab("mods"); self.flash("Loaded bundle %s." % Path(p).name)
+
+    def save_bundle(self):
+        p = filedialog.asksaveasfilename(title="Save mod bundle", defaultextension=".json", initialfile=(self.path.stem + ".bundle.json") if self.path else "fiorencia.bundle.json", filetypes=[("JSON bundle", "*.json")])
+        if not p: return
+        try: self._write_bundle(p); self.bundle_file = Path(p); self._update_bundle_label(); self.flash("Saved bundle to %s." % p)
+        except Exception as e: messagebox.showerror("Save failed", str(e), parent=self)
+
+    def insert_sample_bundle(self):
+        if self._bundle_has_data() and not messagebox.askyesno("Replace mod data", "Replace the current mod data with the sample bundle? (Undo is available.)", parent=self): return
+        self.push_undo(); self.bundle = copy.deepcopy(DEFAULT_BUNDLE)
+        for k in SECTIONS: self.bundle.setdefault(k, [])
+        self.changed(); self.refresh_all(); self.flash("Sample bundle inserted.")
+
+    def clear_bundle(self):
+        if self._bundle_has_data() and not messagebox.askyesno("Clear mod data", "Remove all mod content rows? (Undo is available. An existing MOD ZONE in the source is left untouched until you add rows again.)", parent=self): return
+        self.push_undo(); self.bundle = {k: [] for k in SECTIONS}; self.bundle_file = None
+        self.changed(); self.refresh_all()
+
+    # ------------------------------------------------------------ 4. Item wizard
+    def _item_wizard_tab(self, frame):
+        ttk.Label(frame, text="Guided item design. Saves a separate design specification and integration checklist; it does NOT silently make an item playable in the C++ game.", wraplength=1080, style="Muted.TLabel").pack(anchor="w", padx=10, pady=(10, 5))
+        body = ttk.Panedwindow(frame, orient="horizontal"); body.pack(fill="both", expand=True, padx=8, pady=5)
+        left = ttk.Frame(body); right = ttk.Frame(body); body.add(left, weight=2); body.add(right, weight=3)
+        ttk.Label(left, text="Saved designs").pack(anchor="w")
+        self.design_tree = ttk.Treeview(left, columns=("type", "name", "status"), show="headings", height=14)
+        for col, width in (("type", 95), ("name", 190), ("status", 105)):
+            self.design_tree.heading(col, text=col.title()); self.design_tree.column(col, width=width, stretch=True)
+        self.design_tree.pack(fill="both", expand=True, pady=4)
+        self.design_tree.bind("<<TreeviewSelect>>", self.select_item_design)
+        for text, cmd in (("New item design", self.new_item_design), ("Duplicate selected", self.duplicate_item_design), ("Delete selected design", self.delete_item_design)):
+            ttk.Button(left, text=text, command=cmd).pack(fill="x", pady=2)
+        fields = ttk.Frame(right); fields.pack(fill="x")
+        self.design_vars = {k: tk.StringVar(value=v) for k, v in {"key": "new_item", "name": "New Item", "type": "Consumable", "effect": "Restore health", "magnitude": "3", "secondary_effect": "", "chance_pct": "0", "duration_turns": "0", "sp_cost": "0", "accuracy": "", "price": "20", "currency": "Florins", "description": ""}.items()}
+        def entry(label, key):
+            row = ttk.Frame(fields); row.pack(fill="x", pady=2); ttk.Label(row, text=label, width=24).pack(side="left")
+            ttk.Entry(row, textvariable=self.design_vars[key]).pack(side="left", fill="x", expand=True)
+        def combo(label, key, values):
+            row = ttk.Frame(fields); row.pack(fill="x", pady=2); ttk.Label(row, text=label, width=24).pack(side="left")
+            ttk.Combobox(row, textvariable=self.design_vars[key], values=values, state="readonly").pack(side="left", fill="x", expand=True)
+        entry("Stable ID / key", "key"); entry("Display name", "name")
+        combo("Item type", "type", ["Consumable", "Weapon", "Armor", "Spell", "Quest item", "Magical item"])
+        for label, key in (("Effect / behavior", "effect"), ("Effect magnitude", "magnitude"), ("Secondary effect (optional)", "secondary_effect"), ("Secondary chance %", "chance_pct"), ("Duration (turns)", "duration_turns"), ("SP cost (spells)", "sp_cost"), ("Accuracy (optional)", "accuracy")): entry(label, key)
+        combo("Shop currency", "currency", ["Florins", "Pence", "Not sold"]); entry("Shop price", "price")
+        ttk.Label(right, text="Description / flavor text").pack(anchor="w", pady=(6, 1))
+        self.design_desc = tk.Text(right, height=3, wrap="word", font=("TkDefaultFont", 9)); self.design_desc.pack(fill="x")
+        self.design_shop = tk.BooleanVar(value=True); self.design_quest = tk.BooleanVar(value=False); self.design_nighteye = tk.BooleanVar(value=False)
+        for text, var in (("Available in a shop", self.design_shop), ("Can be granted as a quest reward", self.design_quest), ("Available during Potion of Nighteye encounters", self.design_nighteye)):
+            ttk.Checkbutton(right, text=text, variable=var).pack(anchor="w")
+        self.design_problems = ttk.Label(right, text="", style="Dirty.TLabel", wraplength=560, justify="left"); self.design_problems.pack(anchor="w", pady=(4, 0))
+        actions = ttk.Frame(right); actions.pack(fill="x", pady=6)
+        ttk.Button(actions, text="Save design", command=self.save_item_design).pack(side="left")
+        ttk.Button(actions, text="Save all designs to file…", command=self.export_item_designs).pack(side="left", padx=4)
+        ttk.Button(actions, text="Save beside source", command=self.save_design_sidecar).pack(side="left", padx=4)
+        ttk.Label(right, text="Integration checklist (updates as you type)").pack(anchor="w", pady=(4, 1))
+        fr, self.design_checklist = scrolled_text(right, wrap="word", height=8, font=("TkFixedFont", 9), state="disabled"); fr.pack(fill="both", expand=True)
+        live = lambda *_: self._design_live()
+        for v in list(self.design_vars.values()) + [self.design_shop, self.design_quest, self.design_nighteye]: v.trace_add("write", live)
+        self.design_desc.bind("<KeyRelease>", live)
+        self.refresh_design_tree(); self.refresh_design_checklist()
+
+    def _design_live(self):
+        if self._loading_design or not hasattr(self, "design_checklist"): return
+        d = self._design_record_from_form(); self.refresh_design_checklist(d)
+        errs = self._item_design_errors(d); self.design_problems.config(text=("• " + "\n• ".join(errs)) if errs else "")
+
+    def _design_record_from_form(self):
+        v = self.design_vars
+        return {"key": v["key"].get().strip(), "name": v["name"].get().strip(), "type": v["type"].get(), "effect": v["effect"].get().strip(),
+                "magnitude": v["magnitude"].get().strip(), "secondary_effect": v["secondary_effect"].get().strip(), "chance_pct": v["chance_pct"].get().strip(),
+                "duration_turns": v["duration_turns"].get().strip(), "sp_cost": v["sp_cost"].get().strip(), "accuracy": v["accuracy"].get().strip(), "price": v["price"].get().strip(),
+                "currency": v["currency"].get(), "description": self.design_desc.get("1.0", "end-1c").strip(), "shop": bool(self.design_shop.get()),
+                "quest_reward": bool(self.design_quest.get()), "nighteye": bool(self.design_nighteye.get()), "status": "Design only — runtime integration required"}
+
+    def _load_design_form(self, design):
+        self._loading_design = True
+        try:
+            for key in self.design_vars: self.design_vars[key].set(str(design.get(key, "")))
+            self.design_shop.set(bool(design.get("shop", False))); self.design_quest.set(bool(design.get("quest_reward", False))); self.design_nighteye.set(bool(design.get("nighteye", False)))
+            self.design_desc.delete("1.0", "end"); self.design_desc.insert("1.0", design.get("description", ""))
+        finally: self._loading_design = False
+        self._design_live()
+
+    def new_item_design(self):
+        self.current_design_index = None
+        self._load_design_form({"key": "new_item", "name": "New Item", "type": "Consumable", "effect": "Restore health", "magnitude": "3", "secondary_effect": "", "chance_pct": "0", "duration_turns": "0", "sp_cost": "0", "accuracy": "", "price": "20", "currency": "Florins", "description": "", "shop": True, "quest_reward": False, "nighteye": False})
+        if hasattr(self, "design_tree"): self.design_tree.selection_remove(self.design_tree.selection())
+
+    def select_item_design(self, _event=None):
+        sel = self.design_tree.selection()
+        if not sel: return
+        idx = int(sel[0]); self.current_design_index = idx; self._load_design_form(self.designs[idx])
+
+    def _item_design_errors(self, design):
+        errors = []
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,47}", design["key"]): errors.append("ID must start with a letter and contain only letters, numbers and underscores (2–48 characters).")
+        if not design["name"]: errors.append("Display name is required.")
+        if not design["effect"]: errors.append("Effect / behavior is required.")
+        try:
+            if not 0 <= int(design["magnitude"]) <= 100000: errors.append("Effect magnitude must be between 0 and 100000.")
+        except ValueError: errors.append("Effect magnitude must be a whole number.")
+        for field, label, low, high in (("chance_pct", "Secondary chance", 0, 100), ("duration_turns", "Duration", 0, 10000), ("sp_cost", "SP cost", 0, 100000)):
+            try:
+                if not low <= int(design.get(field, "0")) <= high: errors.append("%s must be between %d and %d." % (label, low, high))
+            except ValueError: errors.append("%s must be a whole number." % label)
+        if design.get("accuracy"):
+            try:
+                if not 0 <= int(design["accuracy"]) <= 100: errors.append("Accuracy must be between 0 and 100.")
+            except ValueError: errors.append("Accuracy must be a whole number or blank.")
+        if design["shop"]:
+            try:
+                if not 0 <= int(design["price"]) <= 100000000: errors.append("Shop price must be between 0 and 100000000.")
+            except ValueError: errors.append("Shop price must be a whole number when shop availability is enabled.")
+        if any(d.get("key") == design["key"] for i, d in enumerate(self.designs) if i != self.current_design_index): errors.append("This ID is already used by another saved design.")
+        return errors
+
+    def save_item_design(self):
+        design = self._design_record_from_form(); errors = self._item_design_errors(design)
+        if errors: messagebox.showerror("Design not saved", "\n".join(errors), parent=self); return
+        if self.current_design_index is None: self.designs.append(design); self.current_design_index = len(self.designs) - 1
+        else: self.designs[self.current_design_index] = design
+        self.design_dirty = True; self.refresh_design_tree(); self._update_title(); self.update_status(); self.refresh_review()
+        self.design_tree.selection_set(str(self.current_design_index)); self.design_tree.see(str(self.current_design_index))
+        self.flash("Design '%s' staged. Ctrl+S saves designs beside the source." % design["name"])
+
+    def duplicate_item_design(self):
+        sel = self.design_tree.selection()
+        if not sel: self.flash("Select a design first."); return
+        d = copy.deepcopy(self.designs[int(sel[0])]); base = d["key"] + "_copy"; key, n = base, 2
+        while any(x.get("key") == key for x in self.designs): key = "%s%d" % (base, n); n += 1
+        d["key"] = key; d["name"] = d.get("name", "") + " (copy)"; self.designs.append(d); self.design_dirty = True
+        self.refresh_design_tree(); self._update_title(); self.update_status(); self.design_tree.selection_set(str(len(self.designs) - 1))
+
+    def delete_item_design(self):
+        sel = self.design_tree.selection()
+        if not sel: return
+        if not messagebox.askyesno("Delete design", "Delete this design specification? This does not remove any game code.", parent=self): return
+        del self.designs[int(sel[0])]; self.design_dirty = True; self.refresh_design_tree(); self.new_item_design(); self._update_title(); self.refresh_review(); self.update_status()
+
+    def refresh_design_tree(self):
+        if not hasattr(self, "design_tree"): return
+        self.design_tree.delete(*self.design_tree.get_children())
+        for i, d in enumerate(self.designs): self.design_tree.insert("", "end", iid=str(i), values=(d.get("type", ""), d.get("name", ""), "Design only"))
+
+    def refresh_design_checklist(self, design=None):
+        if not hasattr(self, "design_checklist"): return
+        d = design or self._design_record_from_form()
+        lines = ["Item: %s [%s]" % (d.get("name", "(unnamed)"), d.get("key", "no-id")), "[ ] Define or reuse a runtime effect handler for: " + d.get("effect", "unspecified effect"), "[ ] Connect item identity and effect to the game's actual item/use logic"]
+        by_type = {
+            "Consumable": ["[ ] Connect to inventory quantity and consumption rules", "[ ] Handle insufficient/maximum HP or SP and report the result"],
+            "Weapon": ["[ ] Integrate weapon selection, damage roll, and combat display", "[ ] Check equipment persistence and legacy-save defaults"],
+            "Armor": ["[ ] Integrate armor selection and defense calculations", "[ ] Check equipment persistence and legacy-save defaults"],
+            "Spell": ["[ ] Integrate spell list, SP cost, accuracy, target, and combat resolution", "[ ] Update spell information/status displays and backward-compatible ownership persistence"],
+            "Quest item": ["[ ] Define acquisition, quest checks, consumption/retention, and completion paths", "[ ] Check quest flags and save/load behavior"],
+            "Magical item": ["[ ] Decide whether effect is passive, activated, timed, or conditional", "[ ] Integrate the chosen trigger, effect handler, and persistence if stateful"]}
+        lines += by_type.get(d.get("type", "Consumable"), [])
+        if d.get("shop"): lines.append("[ ] Add to shop inventory and purchasing/display logic (price: %s %s)" % (d.get("price", "?"), d.get("currency", "")))
+        if d.get("quest_reward"): lines.append("[ ] Add quest reward grant path and duplicate/repeat-claim rules")
+        if d.get("secondary_effect"): lines.append("[ ] Implement and test secondary effect: %s (%s%% chance; %s turns)" % (d.get("secondary_effect", ""), d.get("chance_pct", 0), d.get("duration_turns", 0)))
+        if d.get("nighteye"): lines.append("[ ] Locate Potion of Nighteye encounter selection and add the availability condition")
+        lines += ["[ ] Review generated source diff", "[ ] Compile with the game's documented C++ flags", "[ ] Test acquisition, use, edge cases, save/reload, and removal/failure paths", "", "Readiness: DESIGN ONLY until all required integration tasks are implemented and tested."]
+        w = self.design_checklist; w.configure(state="normal"); w.delete("1.0", "end"); w.insert("1.0", "\n".join(lines)); w.configure(state="disabled")
+
+    def _design_tasks(self, d):
+        tasks = ["Define/reuse effect handler", "Connect identity to runtime item logic"]
+        t = d.get("type")
+        if t == "Spell": tasks += ["Integrate casting, SP cost, target, and combat resolution", "Update displays and backward-compatible save persistence"]
+        elif t == "Consumable": tasks += ["Connect use and inventory quantity logic"]
+        elif t == "Weapon": tasks += ["Connect weapon damage and combat display"]
+        elif t == "Armor": tasks += ["Connect armor selection and defense calculations"]
+        if d.get("shop"): tasks.append("Connect shop listing and purchase path")
+        if d.get("quest_reward"): tasks.append("Connect quest reward grant path")
+        if d.get("secondary_effect"): tasks.append("Implement secondary effect, chance, and duration")
+        if d.get("nighteye"): tasks.append("Connect Potion of Nighteye encounter availability")
+        return tasks + ["Review diff, compile, and perform gameplay/save tests"]
+
+    def _write_designs(self, p, quiet=False):
+        try:
+            payload = {"format": "fiorencia-item-designs-v1", "source_file": self.path.name if self.path else None, "designs": self.designs}
+            Path(p).write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except Exception as e: messagebox.showerror("Save failed", str(e), parent=self); return False
+        self.design_dirty = False; self._update_title(); self.refresh_review(); self.update_status()
+        if not quiet: messagebox.showinfo("Designs saved", "Saved %d design(s) to:\n%s\n\nThese are planning specifications; they do not change the game's C++ source." % (len(self.designs), p), parent=self)
+        return True
+
+    def save_design_sidecar(self):
+        if not self.path: messagebox.showinfo("Open source first", "Open the game source so the design file can be named beside it.", parent=self); return
+        self._write_designs(self.path.with_suffix(".designs.json"))
+
+    def export_item_designs(self):
+        p = filedialog.asksaveasfilename(title="Save item design specifications", defaultextension=".json", filetypes=[("JSON design file", "*.json")], initialfile=(self.path.stem + ".designs.json") if self.path else "fiorencia.designs.json")
+        if p: self._write_designs(p)
+
+    # ------------------------------------------------------------ 5. Gameplay patches
+    def _features_tab(self, frame):
+        ttk.Label(frame, text="Gameplay-loop changes as named, repeatable source patches embedded in the .cpp (// [DEVPATCH:id…] markers), so the project stays portable. A patch is inserted before/after an anchor that must occur exactly once.", wraplength=1100, style="Muted.TLabel").pack(anchor="w", padx=10, pady=(10, 5))
+        bar = ttk.Frame(frame); bar.pack(fill="x", padx=10, pady=4)
+        ttk.Label(bar, text="Template:").pack(side="left")
+        self.feature_template = tk.StringVar(value="Custom patch")
+        ttk.Combobox(bar, textvariable=self.feature_template, values=list(FEATURE_TEMPLATES), state="readonly", width=31).pack(side="left", padx=5)
+        ttk.Button(bar, text="Load template", command=self.load_feature_template).pack(side="left", padx=3)
+        ttk.Label(bar, text="Patch ID:").pack(side="left", padx=(12, 3))
+        self.feature_id = tk.StringVar(value="custom_feature"); ttk.Entry(bar, textvariable=self.feature_id, width=22).pack(side="left")
+        ttk.Label(frame, text="Anchor: exact text that appears once in the unpatched source").pack(anchor="w", padx=10)
+        self.feature_anchor = tk.Text(frame, height=2, wrap="word", font=("TkFixedFont", 9)); self.feature_anchor.pack(fill="x", padx=10, pady=3)
+        self.feature_anchor.bind("<KeyRelease>", lambda e: self.check_anchor())
+        prow = ttk.Frame(frame); prow.pack(fill="x", padx=10, pady=3)
+        ttk.Label(prow, text="Insert:").pack(side="left")
+        self.feature_position = tk.StringVar(value="before"); ttk.Combobox(prow, textvariable=self.feature_position, values=["before", "after"], state="readonly", width=9).pack(side="left", padx=5)
+        self.anchor_status = ttk.Label(prow, text="", style="Muted.TLabel"); self.anchor_status.pack(side="left", padx=12)
+        ttk.Label(frame, text="C++ code to insert (must obey -fno-exceptions / -fno-rtti / stdio-only rules)").pack(anchor="w", padx=10)
+        self.feature_code = tk.Text(frame, height=9, wrap="none", font=("TkFixedFont", 9), undo=True); self.feature_code.pack(fill="both", expand=True, padx=10, pady=3)
+        actions = ttk.Frame(frame); actions.pack(fill="x", padx=10, pady=4)
+        for text, cmd in (("Add / Update patch", self.upsert_feature_patch), ("New patch", self.new_feature_patch), ("Remove selected patch", self.remove_feature_patch), ("Check anchor", self.check_anchor), ("View diff", self.show_diff), ("Validate", self.validate_project)):
+            ttk.Button(actions, text=text, command=cmd).pack(side="left", padx=(0, 5))
+        ttk.Label(frame, text="Current patches (select a row to load it for editing):").pack(anchor="w", padx=10, pady=(6, 2))
+        self.feature_tree = ttk.Treeview(frame, columns=("id", "position", "anchor"), show="headings", height=5)
+        for col, width in (("id", 180), ("position", 80), ("anchor", 700)):
+            self.feature_tree.heading(col, text=col); self.feature_tree.column(col, width=width, stretch=True)
+        self.feature_tree.pack(fill="x", padx=10, pady=(0, 8)); self.feature_tree.bind("<<TreeviewSelect>>", self.select_feature_patch)
+        self.refresh_feature_tree()
+
+    def check_anchor(self):
+        a = self.feature_anchor.get("1.0", "end-1c")
+        if not self.disk: self.anchor_status.config(text="Open a source file to check anchors.", foreground="#666666"); return
+        if not a: self.anchor_status.config(text="Enter an anchor.", foreground="#666666"); return
+        try: base = self.render_base()
+        except Exception: base = strip_dev_patches(self.disk)
+        n = base.count(a)
+        if n == 1: self.anchor_status.config(text="✔ Anchor matches exactly once (line %d of the unpatched source)." % (base[:base.find(a)].count("\n") + 1), foreground="#2e7d32")
+        elif n == 0: self.anchor_status.config(text="✖ Anchor not found in the source.", foreground="#b00020")
+        else: self.anchor_status.config(text="✖ Anchor occurs %d times — make it longer so it is unique." % n, foreground="#b00020")
+
+    def new_feature_patch(self):
+        self.feature_id.set("custom_feature"); self.feature_position.set("before")
+        self.feature_anchor.delete("1.0", "end"); self.feature_code.delete("1.0", "end"); self.feature_tree.selection_remove(self.feature_tree.selection()); self.check_anchor()
+
+    def load_feature_template(self):
+        data = copy.deepcopy(FEATURE_TEMPLATES.get(self.feature_template.get(), FEATURE_TEMPLATES["Custom patch"]))
+        self.feature_id.set(data["id"]); self.feature_position.set(data["position"])
+        self.feature_anchor.delete("1.0", "end"); self.feature_anchor.insert("1.0", data["anchor"])
+        self.feature_code.delete("1.0", "end"); self.feature_code.insert("1.0", data["code"]); self.check_anchor()
+
+    def refresh_feature_tree(self):
+        if not hasattr(self, "feature_tree"): return
+        self.feature_tree.delete(*self.feature_tree.get_children())
+        for i, patch in enumerate(self.dev_patches): self.feature_tree.insert("", "end", iid=str(i), values=(patch["id"], patch["position"], patch["anchor"].replace("\n", "\\n")[:180]))
+
+    def select_feature_patch(self, _event=None):
+        sel = self.feature_tree.selection()
+        if not sel: return
+        patch = self.dev_patches[int(sel[0])]
+        self.feature_id.set(patch["id"]); self.feature_position.set(patch["position"])
+        self.feature_anchor.delete("1.0", "end"); self.feature_anchor.insert("1.0", patch["anchor"])
+        self.feature_code.delete("1.0", "end"); self.feature_code.insert("1.0", patch["code"]); self.check_anchor()
+
+    def upsert_feature_patch(self):
+        if not self.require_source("Open a C++ source file first."): return
+        patch = {"id": self.feature_id.get().strip(), "position": self.feature_position.get(), "anchor": self.feature_anchor.get("1.0", "end-1c"), "code": self.feature_code.get("1.0", "end-1c")}
+        existing = next((i for i, p in enumerate(self.dev_patches) if p["id"] == patch["id"]), None)
+        candidate = copy.deepcopy(self.dev_patches)
+        if existing is None: candidate.append(patch)
+        else: candidate[existing] = patch
+        try:
+            apply_dev_patches(self.render_base(), candidate)
+            for pattern in BANNED:
+                if re.search(pattern, patch["code"]): raise ValueError("This patch contains a construct forbidden by the game's BUILD NOTES: " + pattern)
+        except Exception as e: messagebox.showerror("Patch not accepted", str(e), parent=self); return
+        self.dev_patches = candidate; self.refresh_feature_tree(); self.changed()
+        self.flash("Patch '%s' %s." % (patch["id"], "added" if existing is None else "updated"))
+
+    def remove_feature_patch(self):
+        sel = self.feature_tree.selection()
+        if not sel: return
+        patch = self.dev_patches[int(sel[0])]
+        if not messagebox.askyesno("Remove patch", "Remove gameplay patch '%s'?" % patch["id"], parent=self): return
+        del self.dev_patches[int(sel[0])]; self.refresh_feature_tree(); self.changed(); self.flash("Patch removed.")
+
+    # ------------------------------------------------------------ 6. Review
+    def _review_tab(self, frame):
+        ttk.Label(frame, text="Pending changes, validation results (with fix hints) and feature dependencies. Readiness labels describe evidence available in this workbench, not proof of gameplay correctness.", wraplength=1080, style="Muted.TLabel").pack(anchor="w", padx=10, pady=(10, 5))
+        row = ttk.Frame(frame); row.pack(fill="x", padx=10, pady=4)
+        for text, cmd in (("Refresh", lambda: self.refresh_review(force=True)), ("Structural self-test of file on disk", self.run_selftest_ui), ("Copy report", self.copy_review)):
+            ttk.Button(row, text=text, command=cmd).pack(side="left", padx=(0, 5))
+        fr, self.review_text = scrolled_text(frame, wrap="word", font=("TkFixedFont", 9), state="disabled"); fr.pack(fill="both", expand=True, padx=10, pady=5)
+        t = self.review_text; t.tag_configure("h", font=("TkFixedFont", 9, "bold"), foreground="#1a4f8b"); t.tag_configure("err", foreground="#b00020")
+        t.tag_configure("ok", foreground="#2e7d32"); t.tag_configure("muted", foreground="#666666")
+
+    def run_selftest_ui(self):
+        if not self.require_source(): return
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try: selftest(str(self.path))
+            except Exception as e: print("SELFTEST ERROR:", e)
+        self.selftest_output = buf.getvalue().strip(); self.refresh_review(force=True)
+
+    def copy_review(self):
+        self.clipboard_clear(); self.clipboard_append(self.review_text.get("1.0", "end-1c")); self.flash("Report copied to clipboard.")
+
+    def _review_lines(self):
+        L = []
+        def add(t="", tag=None): L.append((t, tag))
+        add("PROJECT STATUS", "h")
+        add("Source: %s" % (self.path or "(none open)")); add("Unsaved source changes: %s" % ("yes" if self.dirty else "no"))
+        add("Existing-content edits staged: %d" % len(self.vanilla_edits))
+        for lab in self.vanilla_edits: add("    • " + lab)
+        add("Mod content rows: " + ", ".join("%s %d" % (k, len(self.bundle.get(k, []))) for k in SECTIONS))
+        add("Gameplay patches: %d" % len(self.dev_patches))
+        for p in self.dev_patches: add("    • %s (%s)" % (p["id"], p["position"]))
+        add("Item design specifications: %d%s" % (len(self.designs), " (unsaved)" if self.design_dirty else "")); add()
+        add("VALIDATION", "h")
+        errs = self.get_validation()
+        if errs is None: add("Open a source file to validate.", "muted")
+        elif not errs: add("✔ No structural issues found. (Lexical check only — not a C++ compile.)", "ok")
+        else:
+            for e in errs:
+                add("✖ " + e, "err"); h = hint_for(e)
+                if h: add("    → " + h, "muted")
+        if self.selftest_output:
+            add(); add("SELF-TEST (file on disk, ignores unsaved changes)", "h")
+            for ln in self.selftest_output.splitlines(): add(ln)
+        add(); add("DIFF SUMMARY", "h")
+        src, err = self.get_preview() if self.path else (None, None)
+        if src is None: add(("Preview unavailable: " + err) if err else "No source open.", "muted")
+        else:
+            a, d = diff_counts("".join(difflib.unified_diff(self.disk.splitlines(True), src.splitlines(True))))
+            add("%d line(s) added, %d removed versus the file on disk." % (a, d) if (a or d) else "No differences versus the file on disk.")
+        add(); add("ITEM DESIGNS", "h")
+        if not self.designs: add("No guided item designs yet.", "muted")
+        for d in self.designs:
+            add("- %s [%s]: DESIGN ONLY — runtime integration required" % (d.get("name", "(unnamed)"), d.get("key", "no-id")))
+            for task in self._design_tasks(d): add("    [ ] " + task)
+        for line in ("", "FEATURE DEPENDENCIES", "- Save/load changes: inspect Player fields, fields() serialization, saveGame(), and loadGame().", "- New spells: inspect spell definitions, combat/casting, spell info/status displays, shop/acquisition, and save compatibility.",
+                     "- Shop items: inspect SHOP inventory and doBuy purchase/display logic.", "- Consumables: inspect doUse and inventory quantity handling.", "- Enemies: inspect makeEnemy, plot/encounter selection, combat, and reward handling.",
+                     "- Quest/dialogue content: inspect doQuest, plotBeat, dialogue transitions, and reachable branches.", "", "VALIDATION LEVELS",
+                     "1. Design validation: field presence, value ranges, unique IDs.", "2. Static source validation: lexical balance, anchors, patch markers, known forbidden constructs.",
+                     "3. Compiler validation: only after explicit Build Release / Build Debug.", "4. Gameplay acceptance: manual tests still required; build success does not establish balance or save compatibility."):
+            add(line, "h" if line.isupper() else None)
+        return L
+
+    def refresh_review(self, force=False):
+        if not hasattr(self, "review_text"): return
+        if not force and self._current_tab_key() != "review": return
+        t = self.review_text; t.configure(state="normal"); t.delete("1.0", "end")
+        for text, tag in self._review_lines(): t.insert("end", text + "\n", (tag,) if tag else ())
+        t.configure(state="disabled")
+
+    def validate_project(self):
+        if not self.require_source(): return
+        if not self._vanilla_resolve_pending(): return
+        errs = self.get_validation()
+        self.refresh_review(force=True)
+        if errs:
+            self.select_tab("review"); self.flash("Validation failed: %d issue(s). See hints in Review." % len(errs), 10000)
+        else: self.flash("Validation passed. Static checks only — Build to compile.", 8000)
+
+    # ------------------------------------------------------------ 7. Build & test
+    def _build_tab(self, frame):
+        ttk.Label(frame, text="Build and launch are explicit actions; nothing compiles in the background. Builds use your CURRENT staged source (saved or not) via a temporary file. Requires g++ (C++17) on PATH. Double-click a compiler error line to jump to it in Preview.", wraplength=1100, style="Muted.TLabel").pack(anchor="w", padx=10, pady=(10, 5))
+        row = ttk.Frame(frame); row.pack(fill="x", padx=10, pady=4)
+        self.btn_release = ttk.Button(row, text="Build Release (F5)", command=lambda: self.build_game(False))
+        self.btn_debug = ttk.Button(row, text="Build Debug", command=lambda: self.build_game(True))
+        self.btn_run = ttk.Button(row, text="Build & Run (F8)", command=lambda: self.build_game(False, True))
+        for b in (self.btn_release, self.btn_debug, self.btn_run): b.pack(side="left", padx=(0, 4))
+        ttk.Button(row, text="Launch (F7)", command=self.launch_game).pack(side="left", padx=(8, 4))
+        ttk.Button(row, text="Stop game", command=self.stop_process).pack(side="left", padx=4)
+        ttk.Button(row, text="Clear output", command=lambda: (self.build_output.delete("1.0", "end"))).pack(side="left", padx=4)
+        self.build_state_label = ttk.Label(row, text=self.build_state, style="Muted.TLabel"); self.build_state_label.pack(side="right")
+        argsrow = ttk.Frame(frame); argsrow.pack(fill="x", padx=10, pady=4)
+        ttk.Label(argsrow, text="Launch args:").pack(side="left")
+        self.run_args = tk.StringVar(value=self.settings.get("run_args", "--plain"))
+        ttk.Combobox(argsrow, textvariable=self.run_args, values=ARG_PRESETS).pack(side="left", fill="x", expand=True, padx=5)
+        inrow = ttk.Frame(frame); inrow.pack(fill="x", padx=10, pady=4)
+        ttk.Label(inrow, text="Game input:").pack(side="left")
+        self.game_input = tk.StringVar(); ent = ttk.Entry(inrow, textvariable=self.game_input); ent.pack(side="left", fill="x", expand=True, padx=5)
+        ent.bind("<Return>", lambda e: self.send_game_input()); ent.bind("<Up>", lambda e: self._history(-1)); ent.bind("<Down>", lambda e: self._history(1))
+        ttk.Button(inrow, text="Send", command=self.send_game_input).pack(side="left")
+        qrow = ttk.Frame(frame); qrow.pack(fill="x", padx=10, pady=(0, 4)); ttk.Label(qrow, text="Quick:").pack(side="left")
+        for c in ("work", "rest", "quest", "buy", "status", "help", "end", "save", "quit"): ttk.Button(qrow, text=c, width=7, command=lambda c=c: self.send_game_input(c)).pack(side="left", padx=2)
+        fr, self.build_output = scrolled_text(frame, wrap="word", font=("TkFixedFont", 9), height=20); fr.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        t = self.build_output
+        t.tag_configure("err", foreground="#b00020"); t.tag_configure("warn", foreground="#b26a00"); t.tag_configure("ok", foreground="#2e7d32", font=("TkFixedFont", 9, "bold"))
+        t.tag_configure("cmd", foreground="#1a4f8b"); t.tag_configure("note", foreground="#666666")
+        t.bind("<Double-Button-1>", self._on_output_click)
+
+    def _log_output(self, value, tag=None):
+        if not hasattr(self, "build_output"): return
+        t = self.build_output; value = ANSI_RE.sub("", value)
+        for line in value.splitlines(True):
+            tg = tag
+            if tg is None:
+                m = DIAG_RE.match(line)
+                if m: tg = "err" if "error" in m.group("kind") else "warn" if m.group("kind") == "warning" else "note"
+            t.insert("end", line, (tg,) if tg else ())
+        t.see("end")
+
+    def _on_output_click(self, e):
+        line = self.build_output.get("@%d,%d linestart" % (e.x, e.y), "@%d,%d lineend" % (e.x, e.y))
+        m = DIAG_RE.match(line)
+        if m and "workbench_build" in m.group("file"):
+            if self._build_is_current(): self.goto_preview_line(int(m.group("line")))
+            else: self.flash("Source changed since that build; line numbers may be off.", 8000); self.goto_preview_line(int(m.group("line")))
+
+    def _history(self, step):
+        if not self.game_history: return "break"
+        self.game_hist_pos = max(0, min(len(self.game_history), self.game_hist_pos + step))
+        self.game_input.set(self.game_history[self.game_hist_pos] if self.game_hist_pos < len(self.game_history) else ""); return "break"
+
+    def _set_build_buttons(self, enabled):
+        for b in (self.btn_release, self.btn_debug, self.btn_run, self.tb_build): b.state(["!disabled"] if enabled else ["disabled"])
+
+    def build_game(self, debug=False, run_after=False):
+        if not self.require_source(): return
+        if self.build_running: self.flash("A build is already running."); return
+        if self.proc and self.proc.poll() is None:
+            if not messagebox.askyesno("Game running", "Stop the running game and rebuild?", parent=self): return
+            self.stop_process()
+            try: self.proc.wait(timeout=2)
+            except Exception: pass
+        if not self._vanilla_resolve_pending(): return
+        src, err = self.get_preview()
+        if err: messagebox.showerror("Build blocked", "Preview failed:\n" + err, parent=self); return
+        errors = self.get_validation()
+        if errors:
+            self.select_tab("review")
+            messagebox.showerror("Validation failed", "Fix these before building:\n\n" + "\n".join(errors[:12]) + ("\n…" if len(errors) > 12 else "") + "\n\nSee the Review tab for hints.", parent=self); return
+        if not shutil.which("g++"):
+            messagebox.showerror("g++ not found", "g++ is not on PATH.\nInstall a C++17 compiler (MinGW-w64 / MSYS2 on Windows, build-essential on Linux, Xcode tools on macOS) and restart the workbench.", parent=self); return
+        self.select_tab("build"); self.run_after_build = run_after
+        temp_src = self.path.with_name(self.path.stem + ".workbench_build.cpp")
+        exe_path = self.path.with_name(self.path.stem + (".debug" if debug else ".dev") + (".exe" if os.name == "nt" else ""))
+        try: temp_src.write_bytes(src.encode("utf-8"))
+        except Exception as e: messagebox.showerror("Build failed to start", str(e), parent=self); return
+        if debug: cmd = ["g++", "-std=c++17", "-O0", "-g", str(temp_src), "-o", str(exe_path)]
+        else: cmd = ["g++", "-std=c++17", "-Os", "-s", "-fno-exceptions", "-fno-rtti", "-ffunction-sections", "-fdata-sections", str(temp_src), "-Wl,--gc-sections", "-o", str(exe_path)]
+        self._log_output("\n$ " + " ".join(shlex.quote(x) for x in cmd) + "\n", "cmd")
+        self.build_running = True; self.built_binary = None; self._set_build_buttons(False); self.update_status()
+        digest = hashlib.sha1(src.encode("utf-8")).hexdigest(); cwd = str(self.path.parent); flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        def worker():
+            started = time.time()
+            try:
+                r = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180, creationflags=flags)
+                text = r.stdout.decode("utf-8", "replace")
+                self.output_queue.put(("log", text or "(no compiler output)\n"))
+                diags = [DIAG_RE.match(ln) for ln in text.splitlines()]
+                ne = sum(1 for m in diags if m and "error" in m.group("kind"))
+                nw = sum(1 for m in diags if m and m.group("kind") == "warning")
+                self.output_queue.put(("build_done", r.returncode == 0, r.returncode, str(exe_path), digest, debug, ne, nw, time.time() - started, str(temp_src)))
+            except Exception as exc:
+                self.output_queue.put(("log", "\nBUILD ERROR: %s\n" % exc)); self.output_queue.put(("build_done", False, -1, str(exe_path), digest, debug, 0, 0, time.time() - started, str(temp_src)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_build_done(self, ok, rc, exe, digest, debug, nerr, nwarn, secs, temp):
+        self.build_running = False; self._set_build_buttons(True)
+        if ok:
+            self.built_binary = Path(exe); self.build_hash = digest; self.build_state = "Build OK"
+            self._log_output("\nBUILD OK in %.1fs (%d warning(s)): %s\n" % (secs, nwarn, exe), "ok")
+            if not debug:
+                try: Path(temp).unlink()
+                except OSError: pass
+        else:
+            self.build_state = "Build failed"
+            self._log_output("\nBUILD FAILED (exit %s): %d error(s), %d warning(s). Double-click an error line to jump to it.\n" % (rc, nerr, nwarn), "err")
+        self.update_status()
+        if ok and self.run_after_build: self.launch_game(skip_stale_check=True)
+        self.run_after_build = False
+
+    def launch_game(self, skip_stale_check=False):
+        if self.proc and self.proc.poll() is None: messagebox.showwarning("Already running", "A game process is already running.", parent=self); return
+        binary = self.built_binary
+        if not binary or not Path(binary).exists(): messagebox.showinfo("No build", "Build Release or Build Debug first (F5).", parent=self); return
+        if not skip_stale_check and not self._build_is_current():
+            if not messagebox.askyesno("Build is older than your edits", "The built binary does not include your latest changes. Launch it anyway?", parent=self): return
+        try:
+            args = shlex.split(self.run_args.get(), posix=(os.name != "nt")); cmd = [str(binary)] + args
+            self.select_tab("build"); self._log_output("\n$ " + " ".join(shlex.quote(x) for x in cmd) + "\n", "cmd")
+            self.proc = subprocess.Popen(cmd, cwd=str(self.path.parent), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            def reader(proc):
+                dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                try:
+                    while True:
+                        chunk = os.read(proc.stdout.fileno(), 4096)
+                        if not chunk: break
+                        self.output_queue.put(("log", dec.decode(chunk)))
+                    self.output_queue.put(("log", "\nGAME EXITED (code %s).\n" % proc.wait()))
+                except Exception as exc: self.output_queue.put(("log", "\nGAME OUTPUT ERROR: %s\n" % exc))
+            threading.Thread(target=reader, args=(self.proc,), daemon=True).start()
+        except Exception as e: messagebox.showerror("Launch failed", str(e), parent=self)
+
+    def send_game_input(self, text=None):
+        if not self.proc or self.proc.poll() is not None or not self.proc.stdin: messagebox.showinfo("No running game", "Launch the built game first (F7).", parent=self); return
+        text = self.game_input.get() if text is None else text
+        try:
+            self.proc.stdin.write((text + "\n").encode("utf-8")); self.proc.stdin.flush()
+            self._log_output("« %s\n" % text, "cmd")
+            if text and (not self.game_history or self.game_history[-1] != text): self.game_history.append(text)
+            self.game_hist_pos = len(self.game_history); self.game_input.set("")
+        except Exception as e: messagebox.showerror("Input failed", str(e), parent=self)
+
+    def stop_process(self):
+        if self.proc and self.proc.poll() is None: self.proc.terminate(); self._log_output("\nTermination requested.\n", "note")
+
+    def _poll_process_output(self):
+        try:
+            while True:
+                item = self.output_queue.get_nowait()
+                if item[0] == "log": self._log_output(item[1])
+                elif item[0] == "build_done": self._on_build_done(*item[1:])
+        except queue.Empty: pass
+        if self.winfo_exists(): self.after(100, self._poll_process_output)
+
+    # ------------------------------------------------------------ 8. Preview / diff
+    def _raw_tab(self, frame):
+        c = ttk.Frame(frame); c.pack(fill="x", padx=6, pady=4)
+        ttk.Checkbutton(c, text="Diff vs. disk", variable=self.diffvar, command=self.refresh_raw).pack(side="left")
+        ttk.Button(c, text="◀ Prev change", command=lambda: self._jump_change(-1)).pack(side="left", padx=(10, 2))
+        ttk.Button(c, text="Next change ▶", command=lambda: self._jump_change(1)).pack(side="left", padx=2)
+        ttk.Label(c, text="Find:").pack(side="left", padx=(12, 3))
+        self.find_var = tk.StringVar(); fe = ttk.Entry(c, textvariable=self.find_var, width=18); fe.pack(side="left")
+        fe.bind("<Return>", lambda e: self.find_next()); self.find_var.trace_add("write", lambda *_: setattr(self, "_find_pos", "1.0"))
+        ttk.Button(c, text="Next", command=self.find_next).pack(side="left", padx=3)
+        ttk.Label(c, text="Line:").pack(side="left", padx=(10, 3))
+        self.goto_var = tk.StringVar(); ge = ttk.Entry(c, textvariable=self.goto_var, width=7); ge.pack(side="left")
+        ge.bind("<Return>", lambda e: self.goto_line_from_entry())
+        self.raw_stats = ttk.Label(c, text="", style="Muted.TLabel"); self.raw_stats.pack(side="right")
+        ttk.Button(c, text="Copy", command=self.copy_preview).pack(side="right", padx=6)
+        fr, self.raw = scrolled_text(frame, font=("TkFixedFont", 9), state="disabled"); fr.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        config_diff_tags(self.raw)
+        self.raw.bind("<Control-f>", lambda e: (fe.focus_set(), "break")[1]); self.raw.bind("<Control-g>", lambda e: (ge.focus_set(), "break")[1])
+        self._find_entry, self._goto_entry = fe, ge
+
+    def refresh_raw(self, force=False):
+        if self.raw is None: return
+        if not force and self._current_tab_key() != "raw": return
+        diff = bool(self.diffvar.get()) and bool(self.path); key = (self._rev, diff, str(self.path))
+        if not force and key == self._raw_key: return
+        self._raw_key = key; self._find_pos = "1.0"
+        if not self.path: text = "(Open a Fiorencia C++ source file to preview generated source.)"
+        else:
+            src, err = self.get_preview()
+            if err: text, diff = "PREVIEW ERROR: " + err, False
+            elif diff:
+                text = "".join(difflib.unified_diff(self.disk.splitlines(True), src.splitlines(True), fromfile="disk", tofile="preview")) or "(No differences vs. disk.)"
+            else: text = src
+        w = self.raw; w.configure(state="normal"); w.delete("1.0", "end"); w.insert("1.0", text)
+        if diff: colorize_diff(w, text)
+        w.configure(state="disabled")
+        if diff: a, d = diff_counts(text); self.raw_stats.config(text="+%d / -%d lines" % (a, d))
+        else: self.raw_stats.config(text="%d lines" % (text.count("\n") + 1))
+
+    def show_diff(self):
+        self.diffvar.set(True); self.select_tab("raw"); self.refresh_raw(force=True)
+
+    def _jump_change(self, direction):
+        if not self.diffvar.get(): self.diffvar.set(True); self.refresh_raw(force=True)
+        w = self.raw; starts = [str(r) for r in w.tag_ranges("hunk")][::2]
+        if not starts: self.flash("No changes versus disk."); return
+        cur = w.index("@0,0")
+        if direction > 0: cand = [s for s in starts if w.compare(s, ">", cur)]; target = cand[0] if cand else starts[0]
+        else: cand = [s for s in starts if w.compare(s, "<", cur)]; target = cand[-1] if cand else starts[-1]
+        w.yview(target)
+
+    def find_next(self):
+        q = self.find_var.get()
+        if not q or self.raw is None: return
+        w = self.raw; w.tag_remove("find", "1.0", "end")
+        pos = w.search(q, self._find_pos, stopindex="end", nocase=True) or w.search(q, "1.0", stopindex="end", nocase=True)
+        if not pos: self.flash("Not found: " + q); return
+        end = "%s+%dc" % (pos, len(q)); w.tag_add("find", pos, end); w.see(pos); self._find_pos = end
+
+    def goto_line_from_entry(self):
+        try: self.goto_preview_line(int(self.goto_var.get()), switch=False)
+        except ValueError: self.flash("Enter a line number.")
+
+    def goto_preview_line(self, n, switch=True):
+        if switch:
+            self.diffvar.set(False); self.select_tab("raw")
+        self.refresh_raw(force=True)
+        w = self.raw; w.tag_remove("target", "1.0", "end"); idx = "%d.0" % max(1, n)
+        w.tag_add("target", idx, "%d.end" % max(1, n)); w.yview("%d.0-3l" % max(1, n))
+
+    def copy_preview(self):
+        self.clipboard_clear(); self.clipboard_append(self.raw.get("1.0", "end-1c")); self.flash("Copied to clipboard.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Fiorencia Development Workbench")
+    ap.add_argument("--version", action="version", version="Fiorencia Development Workbench " + WORKBENCH_VERSION)
+    ap.add_argument("source", nargs="?", help="Fiorencia C++ source file (.cpp)")
+    ap.add_argument("--selftest", nargs="?", const="", help="validate source structure and patch markers")
+    ns = ap.parse_args()
+    if ns.selftest is not None:
+        target = ns.selftest or ns.source
+        if not target: ap.error("--selftest needs a source path (or pass the source as positional argument)")
+        return selftest(target)
+    app = Editor(ns.source); app.mainloop(); return 0
+
+
+if __name__ == "__main__": raise SystemExit(main())
 
